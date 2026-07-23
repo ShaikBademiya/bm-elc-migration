@@ -48,17 +48,21 @@ jobs:
 
             dags:
               - 'artifacts/dags/**'
-            
+
             dbt:
               - 'artifacts/dbt/**'
-            
+
             config:
               - 'artifacts/configs/**'
+              - 'artifacts/jobs/**'
 
   build-wheel:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.python == 'true'
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +74,10 @@ jobs:
       - name: Set package version
         run: |
             VERSION="0.0.${GITHUB_RUN_NUMBER}"
-            echo "Setting package version to ${VERSION}"
+
+            echo "Package version: ${VERSION}"
+
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
             sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
 
@@ -92,7 +99,7 @@ jobs:
           name: pipeline-wheel
           path: dist/*.whl
 
-  deploy-artifact-registry:
+  deploy-artifact-registry-python:
     runs-on: ubuntu-latest
     needs: build-wheel
     if: needs.build-wheel.result == 'success'
@@ -123,13 +130,81 @@ jobs:
           TWINE_USERNAME: oauth2accesstoken
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_REPOSITORY }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
         run: |
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
 
           python -m twine upload --verbose \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
+
+  deploy-artifact-registry-docker:
+    runs-on: ubuntu-latest
+
+    needs: build-wheel
+
+    if: needs.build-wheel.result == 'success'
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-wheel
+          path: dist
+
+      - name: Verify wheel
+        run: |
+          echo "Wheel used for Docker image:"
+          ls -lh dist/
+
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+
+      - name: Configure Docker authentication
+        run: |
+          gcloud auth configure-docker \
+            ${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev
+
+
+      - name: Build Docker image
+        env:
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
+          VERSION: ${{ needs.build-wheel.outputs.version }}
+
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf:${VERSION}"
+
+          echo "Building image:"
+          echo "${IMAGE}"
+
+          docker build \
+            -t "${IMAGE}" \
+            .
+
+      - name: Push Docker image
+        env:
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
+          VERSION: ${{ needs.build-wheel.outputs.version }}
+
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf:${VERSION}"
+
+          echo "Pushing image:"
+          echo "${IMAGE}"
+
+          docker push "${IMAGE}"
 
   deploy-dags:
     runs-on: ubuntu-latest
@@ -150,7 +225,7 @@ jobs:
           gsutil -m rsync -r -d \
             artifacts/dags/ \
             gs://${{ secrets.COMPOSER_BUCKET }}/dags/
-  
+
   deploy-dbt:
     runs-on: ubuntu-latest
     needs: changes
@@ -170,7 +245,7 @@ jobs:
           gsutil -m rsync -r -d \
             artifacts/dbt/ \
             gs://${{ secrets.COMPOSER_BUCKET }}/dbt/
-  
+
   deploy-config:
     runs-on: ubuntu-latest
     needs: changes

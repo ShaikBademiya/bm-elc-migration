@@ -1,0 +1,12 @@
+.git
+.github
+
+.venv
+.vscode
+
+__pycache__
+*.pyc
+
+build
+
+.env
