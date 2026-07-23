@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "amf"
-dynamic = ["version"]
+version = "0.0.0"
 description = "Automated Migration Framework — agent-driven data pipeline automation"
 requires-python = ">=3.10"
 dependencies = [
@@ -49,11 +49,6 @@ dev = [
 
 [project.scripts]
 amf-pipeline = "amf.core.entry:main"
-
-[tool.setuptools-scm]
-version_scheme = "guess-next-dev"
-local_scheme = "node-and-date"
-fallback_version = "0.1.0.dev0"
 
 [tool.ruff]
 line-length = 100
