@@ -102,7 +102,7 @@ jobs:
         run: |
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
 
-          python -m twine upload \
+          python -m twine upload --verbose \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
 
