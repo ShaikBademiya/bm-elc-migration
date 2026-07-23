@@ -72,6 +72,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Set package version
+        id: version
         run: |
             VERSION="0.0.${GITHUB_RUN_NUMBER}"
 
