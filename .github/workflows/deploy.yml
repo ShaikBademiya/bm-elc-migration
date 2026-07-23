@@ -27,6 +27,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       dags: ${{ steps.filter.outputs.dags }}
       dbt: ${{ steps.filter.outputs.dbt }}
+      config: ${{ steps.filter.outputs.config }}
 
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +51,9 @@ jobs:
             
             dbt:
               - 'artifacts/dbt/**'
+            
+            config:
+              - 'artifacts/configs/**'
 
   build-wheel:
     runs-on: ubuntu-latest
@@ -76,10 +80,11 @@ jobs:
       - name: Build wheel
         run: uv build --wheel
 
-      - name: Inspect generated wheel
-        run: |
-            echo "Generated wheel files:"
-            ls -lh dist/
+      # Optional: Inspect the generated wheel files for debugging purposes
+      # - name: Inspect generated wheel
+      #   run: |
+      #       echo "Generated wheel files:"
+      #       ls -lh dist/
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -165,3 +170,22 @@ jobs:
           gsutil -m rsync -r -d \
             artifacts/dbt/ \
             gs://${{ secrets.COMPOSER_BUCKET }}/dbt/
+  
+  deploy-config:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.config == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync config files
+        run: |
+          gsutil -m rsync -r -d \
+            artifacts/configs/ \
+            gs://${{ secrets.COMPOSER_BUCKET }}/configs/
