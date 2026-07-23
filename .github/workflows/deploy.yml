@@ -60,16 +60,36 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - name: Set package version
+        run: |
+            VERSION="0.0.${GITHUB_RUN_NUMBER}"
+            echo "Setting package version to ${VERSION}"
+
+            python <<EOF
+            from pathlib import Path
+            import re
+
+            pyproject = Path("pyproject.toml")
+            text = pyproject.read_text()
+
+            text = re.sub(
+                r'^version = ".*"$',
+                f'version = "{VERSION}"',
+                text,
+                flags=re.MULTILINE,
+            )
+
+            pyproject.write_text(text)
+            print(pyproject.read_text())
+            EOF
+
       - name: Build wheel
         run: uv build --wheel
 
       - name: Inspect generated wheel
         run: |
-            echo "========================================="
             echo "Generated wheel files:"
-            echo "========================================="
             ls -lh dist/
-            echo "========================================="
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
