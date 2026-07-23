@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload wheel to Artifact Registry
         env:
-          TWINE_USERNAME: __token__
+          TWINE_USERNAME: oauth2accesstoken
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_REPOSITORY }}
