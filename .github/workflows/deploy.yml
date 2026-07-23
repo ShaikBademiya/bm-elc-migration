@@ -65,23 +65,10 @@ jobs:
             VERSION="0.0.${GITHUB_RUN_NUMBER}"
             echo "Setting package version to ${VERSION}"
 
-            python <<EOF
-            from pathlib import Path
-            import re
+            sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
 
-            pyproject = Path("pyproject.toml")
-            text = pyproject.read_text()
-
-            text = re.sub(
-                r'^version = ".*"$',
-                f'version = "{VERSION}"',
-                text,
-                flags=re.MULTILINE,
-            )
-
-            pyproject.write_text(text)
-            print(pyproject.read_text())
-            EOF
+            echo "Updated pyproject.toml:"
+            grep '^version' pyproject.toml
 
       - name: Build wheel
         run: uv build --wheel
