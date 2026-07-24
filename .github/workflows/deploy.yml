@@ -27,7 +27,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       dags: ${{ steps.filter.outputs.dags }}
       dbt: ${{ steps.filter.outputs.dbt }}
-      config: ${{ steps.filter.outputs.config }}
+      configs_jobs: ${{ steps.filter.outputs.configs_jobs }}
 
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
             dbt:
               - 'artifacts/dbt/**'
 
-            config:
+            configs_jobs:
               - 'artifacts/configs/**'
               - 'artifacts/jobs/**'
 
@@ -247,10 +247,10 @@ jobs:
             artifacts/dbt/ \
             gs://${{ secrets.COMPOSER_BUCKET }}/dbt/
 
-  deploy-config:
+  deploy-configs-jobs:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.config == 'true'
+    if: needs.changes.outputs.configs_jobs == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -265,3 +265,9 @@ jobs:
           gsutil -m rsync -r -d \
             artifacts/configs/ \
             gs://${{ secrets.COMPOSER_BUCKET }}/configs/
+
+      - name: Sync job files
+        run: |
+          gsutil -m rsync -r -d \
+            artifacts/jobs/ \
+            gs://${{ secrets.COMPOSER_BUCKET }}/jobs/
