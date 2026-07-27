@@ -154,3 +154,7 @@ cython_debug/
 # google-github-actions/auth writes the resolved credential to a file in the
 # workspace. It must never be committed, and must never be copied into an image.
 gha-creds-*.json
+
+# Build-once-promote scratch
+_bundle/
+artifacts-*.tar.gz

@@ -32,6 +32,9 @@ env:
   # shared Composer bucket. Matches the dags/udp/ convention in TRD-002 :569 and
   # the dags/${domain_name}/ convention already used by etp-etl-core.
   DOMAIN: udp
+  # Not a secret - a registry name. Keeping it out of secrets means the
+  # logs stay auditable instead of printing gs://*** and ***-docker.pkg.dev.
+  BUNDLE_REPO: bm-udp-artifacts
   # Upper bound on deletions in a single run, enforced by deploy_artifacts.sh.
   # A larger removal is treated as a bad diff rather than an intent to delete.
   MAX_DELETIONS: 25
@@ -191,6 +194,41 @@ jobs:
             echo "| rebuild wheel/image | \`${PY}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # One version per commit, computed once and reused by every downstream job.
+  # Build-once-deploy-many needs a single identifier that names the wheel, the
+  # image and the artifact bundle produced from this commit; computing it
+  # separately in each job would let them drift.
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    needs: setup
+    timeout-minutes: 10
+
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image_tag: ${{ steps.v.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - name: Compute version
+        id: v
+        run: |
+          set -euo pipefail
+          VERSION="$(uvx --quiet --from 'setuptools-scm>=8' python -m setuptools_scm)"
+          # '+' is legal in PEP 440 but not in a Docker tag or a Generic
+          # Artifact Registry version.
+          SAFE="${VERSION//+/_}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${SAFE}" >> "$GITHUB_OUTPUT"
+          echo "version ${VERSION} (safe: ${SAFE})"
+          echo "| version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+
   # Quality gates. Until now deploy.yml had no `needs:` on any check, so a
   # commit could deploy to the prod bucket with zero checks having run - provable
   # from the check-runs API on b55e898, d008ca4 and a7f6a63, where the only
@@ -215,13 +253,9 @@ jobs:
   build-wheel:
     name: Build wheel
     runs-on: ubuntu-latest
-    needs: [setup, changes, quality]
+    needs: [setup, changes, quality, version]
     if: needs.changes.outputs.python == 'true'
     timeout-minutes: 15
-
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      image_tag: ${{ steps.version.outputs.image_tag }}
 
     steps:
       # fetch-depth: 0 is required, not merely convenient: setuptools-scm derives
@@ -236,35 +270,18 @@ jobs:
       - name: Build wheel
         run: uv build --wheel
 
-      # Read the version off the artifact rather than computing it separately -
-      # the filename is the authoritative answer to "what did we just build".
-      - name: Resolve version
-        id: version
+      - name: Assert the wheel matches the resolved version
+        env:
+          EXPECTED: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           WHEEL="$(ls dist/*.whl | head -1)"
-          VERSION="$(basename "${WHEEL}" | cut -d- -f2)"
-
-          # PEP 440 local segments use '+', which is not a legal character in a
-          # Docker tag ([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}). Substituting it keeps
-          # the sha visible in the tag instead of dropping the local segment.
-          IMAGE_TAG="${VERSION//+/_}"
-
-          echo "wheel     : ${WHEEL}"
-          echo "version   : ${VERSION}"
-          echo "image tag : ${IMAGE_TAG}"
-
-          {
-            echo "version=${VERSION}"
-            echo "image_tag=${IMAGE_TAG}"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "| Artifact | Value |"
-            echo "| --- | --- |"
-            echo "| wheel version | \`${VERSION}\` |"
-            echo "| image tag | \`${IMAGE_TAG}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          ACTUAL="$(basename "${WHEEL}" | cut -d- -f2)"
+          echo "expected ${EXPECTED}, built ${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::wheel version ${ACTUAL} does not match the resolved version ${EXPECTED}"
+            exit 1
+          fi
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -275,7 +292,7 @@ jobs:
   deploy-artifact-registry-python:
     name: Publish wheel to Artifact Registry
     runs-on: ubuntu-latest
-    needs: [setup, build-wheel]
+    needs: [setup, version, build-wheel]
     timeout-minutes: 15
 
     environment:
@@ -308,7 +325,7 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
 
           set -euo pipefail
@@ -335,7 +352,7 @@ jobs:
   deploy-artifact-registry-docker:
     name: Publish image to Artifact Registry
     runs-on: ubuntu-latest
-    needs: [setup, build-wheel]
+    needs: [setup, version, build-wheel]
     timeout-minutes: 30
 
     environment:
@@ -373,7 +390,7 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
@@ -392,16 +409,54 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
           echo "Pushing ${BASE}:${VERSION} and ${BASE}:${GITHUB_SHA}"
           docker push "${BASE}:${VERSION}"
           docker push "${BASE}:${GITHUB_SHA}"
 
-  # The deploy jobs below apply the manifest from `changes` file by file, rather
-  # than replacing the whole destination prefix. Only what changed is copied, and
-  # only what was deleted is removed.
+  # Build once. artifacts/ is packaged into a single versioned bundle and
+  # published to Artifact Registry, and every environment afterwards deploys
+  # THAT bundle rather than a fresh checkout. Without this, each environment
+  # builds its own copy from git and nothing guarantees prod runs the bytes dev
+  # tested.
+  #
+  # Published on every commit, not only when artifacts change, so any version is
+  # promotable.
+  package-artifacts:
+    name: Package artifact bundle
+    runs-on: ubuntu-latest
+    needs: [setup, version, quality, artifacts-valid]
+    timeout-minutes: 15
+
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Publish artifact bundle
+        env:
+          VERSION: ${{ needs.version.outputs.image_tag }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/publish_bundle.sh "${VERSION}"
+
+  # The deploy jobs below take the published bundle for this version and apply
+  # the manifest from `changes` file by file: only what changed is copied, only
+  # what was deleted is removed.
   #
   # They consume the diff, so a wrong diff matters. That is handled at the source:
   # `changes` emits full=true whenever the diff cannot be trusted (new branch,
@@ -410,7 +465,7 @@ jobs:
   deploy-dags:
     name: Deploy DAGs
     runs-on: ubuntu-latest
-    needs: [setup, changes, quality, artifacts-valid]
+    needs: [setup, changes, version, quality, artifacts-valid, package-artifacts]
     timeout-minutes: 15
 
     environment:
@@ -429,6 +484,14 @@ jobs:
 
       # Namespaced under dags/<domain>/ so this domain can only ever touch
       # its own DAGs on a shared Composer bucket.
+      - name: Fetch the published bundle
+        env:
+          VERSION: ${{ needs.version.outputs.image_tag }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
+
       - name: Deploy DAGs
         env:
           # Passed as data, never interpolated into the command. A filename is
@@ -437,12 +500,12 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dags "$DEST" "$MODE"
 
   deploy-dbt:
     name: Deploy dbt project
     runs-on: ubuntu-latest
-    needs: [setup, changes, quality, artifacts-valid]
+    needs: [setup, changes, version, quality, artifacts-valid, package-artifacts]
     timeout-minutes: 15
 
     environment:
@@ -462,6 +525,14 @@ jobs:
       # data/ is the only prefix besides dags/ that Composer mounts into
       # workers (as /home/airflow/gcs/data). A top-level dbt/ prefix is
       # invisible to Airflow.
+      - name: Fetch the published bundle
+        env:
+          VERSION: ${{ needs.version.outputs.image_tag }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
+
       - name: Deploy dbt project
         env:
           # Passed as data, never interpolated into the command. A filename is
@@ -470,12 +541,12 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dbt "$DEST" "$MODE"
 
   deploy-configs:
     name: Deploy configs
     runs-on: ubuntu-latest
-    needs: [setup, changes, quality, artifacts-valid]
+    needs: [setup, changes, version, quality, artifacts-valid, package-artifacts]
     timeout-minutes: 15
 
     environment:
@@ -491,6 +562,14 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Fetch the published bundle
+        env:
+          VERSION: ${{ needs.version.outputs.image_tag }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
 
       - name: Deploy configs
         env:
@@ -500,12 +579,12 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/configs "$DEST" "$MODE"
 
   deploy-jobs:
     name: Deploy job definitions
     runs-on: ubuntu-latest
-    needs: [setup, changes, quality, artifacts-valid]
+    needs: [setup, changes, version, quality, artifacts-valid, package-artifacts]
     timeout-minutes: 15
 
     environment:
@@ -522,6 +601,14 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
+      - name: Fetch the published bundle
+        env:
+          VERSION: ${{ needs.version.outputs.image_tag }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
+
       - name: Deploy job definitions
         env:
           # Passed as data, never interpolated into the command. A filename is
@@ -530,4 +617,4 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/jobs "$DEST" "$MODE"

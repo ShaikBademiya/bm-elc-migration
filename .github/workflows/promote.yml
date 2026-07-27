@@ -1,0 +1,203 @@
+name: Promote
+
+# Build-once-deploy-many: promotion takes a version that ALREADY EXISTS in
+# Artifact Registry and deploys those exact bytes to another environment.
+# Nothing is rebuilt and nothing is read from the git working tree, so the
+# thing that reaches prod is provably the thing that was built and tested.
+#
+# This replaces promotion-by-branch-merge, where `master` built one wheel and
+# `main` built a different one from the same source, and nothing guaranteed
+# they matched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to promote (e.g. 0.1.1.dev4_g9c1d7f1bd). Must already be published.'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - ust
+          - sit
+          - prod
+      dry_run:
+        description: 'Resolve and verify the version without deploying'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# Shared with deploy.yml and release.yml: all three write the same Composer
+# prefixes, so they must not interleave.
+concurrency:
+  group: composer-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  DOMAIN: udp
+  # Not a secret - a registry name. Keeping it out of secrets means the
+  # logs stay auditable instead of printing gs://*** and ***-docker.pkg.dev.
+  BUNDLE_REPO: bm-udp-artifacts
+  MAX_DELETIONS: 25
+
+jobs:
+  # Fails before anything is touched if the version was never published. Without
+  # this, a typo in the input silently promotes nothing and reports success.
+  verify:
+    name: Verify the version exists
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Assert the artifact bundle is published
+        env:
+          VERSION: ${{ inputs.version }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: |
+          set -euo pipefail
+          if ! gcloud artifacts versions describe "${VERSION}" \
+                 --package=artifacts \
+                 --repository="${BUNDLE_REPO}" \
+                 --location="${REGION}" \
+                 --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "::error::artifacts:${VERSION} is not published - nothing to promote."
+            echo "::error::Available versions:"
+            gcloud artifacts versions list --package=artifacts \
+              --repository="${BUNDLE_REPO}" --location="${REGION}" \
+              --project="${PROJECT_ID}" --format="value(name.basename())" | head -20
+            exit 1
+          fi
+          echo "artifacts:${VERSION} is published"
+
+          {
+            echo "### Promoting \`${VERSION}\` to \`${{ inputs.environment }}\`"
+            echo ""
+            echo "| Artifact | Status |"
+            echo "| --- | --- |"
+            echo "| bundle \`artifacts:${VERSION}\` | published |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Informational: the wheel is versioned independently because it is only
+      # rebuilt when code changes, so a config-only version legitimately has no
+      # wheel of its own.
+      - name: Report the companion wheel and image
+        continue-on-error: true
+        env:
+          VERSION: ${{ inputs.version }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          PY_REPO: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
+        run: |
+          PEP440="${VERSION//_/+}"
+          if gcloud artifacts versions describe "${PEP440}" --package=amf \
+               --repository="${PY_REPO}" --location="${REGION}" \
+               --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "| wheel \`amf ${PEP440}\` | published |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| wheel \`amf ${PEP440}\` | not built for this version (code unchanged) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  promote:
+    name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: verify
+    if: ${{ !inputs.dry_run }}
+    timeout-minutes: 20
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Fetch the published bundle
+        env:
+          VERSION: ${{ inputs.version }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
+        run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
+
+      # A promotion reconciles the whole bundle rather than applying a diff: it
+      # publishes a known state, not a change set. Full mode never passes -d, so
+      # it cannot remove another domain's files.
+      - name: Deploy DAGs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dags "$DEST" full
+
+      - name: Deploy dbt project
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dbt "$DEST" full
+
+      - name: Deploy configs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/configs "$DEST" full
+
+      - name: Deploy job definitions
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/jobs "$DEST" full
+
+      # Records what is running where. Written outside every deploy prefix so no
+      # reconciliation can remove it, and it is the answer to "which version is
+      # in prod right now" without reading workflow logs.
+      - name: Record the deployed version
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ inputs.environment }}
+          BUCKET: ${{ secrets.COMPOSER_BUCKET }}
+        run: |
+          set -euo pipefail
+          cat > deployed.json <<JSON
+          {
+            "environment": "${TARGET}",
+            "domain": "${DOMAIN}",
+            "version": "${VERSION}",
+            "promoted_by": "${GITHUB_ACTOR}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "source_sha": "${GITHUB_SHA}"
+          }
+          JSON
+          cat deployed.json
+          gsutil cp deployed.json "gs://${BUCKET}/deploy-manifests/${DOMAIN}/${TARGET}.json"
+
+          {
+            echo ""
+            echo "Deployed \`${VERSION}\` to \`${TARGET}\`."
+            echo "Manifest: \`gs://${BUCKET}/deploy-manifests/${DOMAIN}/${TARGET}.json\`"
+          } >> "$GITHUB_STEP_SUMMARY"
