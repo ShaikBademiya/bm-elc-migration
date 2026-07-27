@@ -72,12 +72,13 @@ jobs:
           done
           exit $status
 
-      - name: Warn on artifact paths Composer does not mount
-        run: |
-          # Composer only mounts gs://<bucket>/dags and gs://<bucket>/data into
-          # workers. deploy.yml currently writes dbt/, configs/ and jobs/ to the
-          # bucket root, where Airflow cannot see them.
-          grep -nE 'gs://\$\{\{ *secrets\.COMPOSER_BUCKET *\}\}/(dbt|configs|jobs)/' \
-            .github/workflows/deploy.yml \
-            && echo "::warning::deploy.yml writes outside dags/ and data/; Composer will not mount these paths" \
-            || echo "all sync destinations are under a Composer-mounted prefix"
+      # Composer mounts only gs://<bucket>/dags and gs://<bucket>/data into
+      # workers, and a destructive rsync is only safe inside a prefix this
+      # domain owns. Both failures are invisible at runtime because gsutil
+      # reports success either way, so they have to be caught statically.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check GCS sync targets
+        run: python .github/scripts/check_sync_targets.py
