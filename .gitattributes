@@ -1,0 +1,23 @@
+# Normalise text in the repository, and check it out with platform-native
+# endings by default.
+* text=auto
+
+# These are executed by a Linux runner. A CRLF shell script fails with
+# "bad interpreter: /usr/bin/env bash^M", and a CRLF workflow can break shell
+# heredocs inside `run:` blocks. Force LF regardless of a contributor's
+# core.autocrlf setting.
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+.gitignore      text eol=lf
+
+# Python is executed on both, but keeping it LF avoids spurious diffs between
+# contributors on different platforms.
+*.py            text eol=lf
+*.toml          text eol=lf
+*.sql           text eol=lf
+*.md            text eol=lf
+
+uv.lock         text eol=lf -diff

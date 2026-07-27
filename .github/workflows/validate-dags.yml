@@ -11,28 +11,40 @@ name: Validate DAGs
 
 on:
   pull_request:
-    paths:
+    paths: &validate_paths
       - 'artifacts/**'
-      - '.github/scripts/validate_artifacts.py'
+      - '.github/scripts/**'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/validate-dags.yml'
+  push:
+    branches:
+      - master
+      - main
+    paths: *validate_paths
+  # Called by deploy.yml. check_sync_targets.py reads deploy.yml and release.yml,
+  # so a change to either must re-run this - previously neither filter matched
+  # and a workflow edit ran no validation at all.
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: validate-dags-${{ github.ref }}
+  group: validate-dags-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
     name: Validate artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
@@ -48,11 +60,10 @@ jobs:
   deployability:
     name: Deployability checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
-
-      # deploy.yml syncs with `gsutil rsync -d`, which deletes anything in the
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # destination prefix that is not in the source. An accidentally emptied
       # artifact directory would therefore wipe the corresponding Composer
       # prefix, and the sync would still report success.
@@ -61,10 +72,10 @@ jobs:
           status=0
           for dir in artifacts/dags artifacts/dbt artifacts/configs artifacts/jobs; do
             if [ ! -d "$dir" ]; then
-              echo "::error::$dir is missing - deploy-configs-jobs and friends will fail on rsync"
+              echo "::error::$dir is missing - its deploy job has nothing to publish"
               status=1
             elif [ -z "$(find "$dir" -type f -print -quit)" ]; then
-              echo "::error::$dir is empty - a destructive rsync would clear its Composer prefix"
+              echo "::error::$dir is empty - a full reconciliation would publish nothing"
               status=1
             else
               echo "$dir: $(find "$dir" -type f | wc -l) file(s)"
@@ -73,10 +84,10 @@ jobs:
           exit $status
 
       # Composer mounts only gs://<bucket>/dags and gs://<bucket>/data into
-      # workers, and a destructive rsync is only safe inside a prefix this
-      # domain owns. Both failures are invisible at runtime because gsutil
+      # workers, and a deploy that removes files is only safe inside a prefix
+      # this domain owns. Both failures are invisible at runtime because gsutil
       # reports success either way, so they have to be caught statically.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
