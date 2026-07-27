@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to promote (e.g. 0.1.1.dev4_g9c1d7f1bd). Must already be published.'
+        description: 'Bundle version, e.g. 0.1.1.dev5-gf43e9109a (hyphens, not +). Must already be published.'
         required: true
         type: string
       environment:
@@ -112,7 +112,10 @@ jobs:
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           PY_REPO: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
         run: |
-          PEP440="${VERSION//_/+}"
+          # The bundle encoding replaces PEP 440's '+' with '-'. Restore only
+          # that separator - the one immediately before the g<sha> local part -
+          # so the wheel can be looked up by its real version.
+          PEP440="$(echo "${VERSION}" | sed -E 's/-(g[0-9a-f]+)/+\1/')"
           if gcloud artifacts versions describe "${PEP440}" --package=amf \
                --repository="${PY_REPO}" --location="${REGION}" \
                --project="${PROJECT_ID}" >/dev/null 2>&1; then

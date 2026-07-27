@@ -207,6 +207,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       image_tag: ${{ steps.v.outputs.image_tag }}
+      bundle_version: ${{ steps.v.outputs.bundle_version }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -221,13 +222,29 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(uvx --quiet --from 'setuptools-scm>=8' python -m setuptools_scm)"
-          # '+' is legal in PEP 440 but not in a Docker tag or a Generic
-          # Artifact Registry version.
-          SAFE="${VERSION//+/_}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "image_tag=${SAFE}" >> "$GITHUB_OUTPUT"
-          echo "version ${VERSION} (safe: ${SAFE})"
-          echo "| version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+          # One version, three encodings, because each registry has a different
+          # charset and PEP 440's '+' is illegal in both of the others.
+          #   PEP 440 / wheel : 0.1.1.dev5+gf43e9109a
+          #   Docker tag      : [a-zA-Z0-9_][a-zA-Z0-9._-]*   -> '+' becomes '_'
+          #   Generic AR      : lowercase, digits, '.', '-'   -> '+' becomes '-'
+          # Verified against the live registry: '_' is rejected there, '-' and
+          # '.' are accepted.
+          IMAGE_TAG="${VERSION//+/_}"
+          BUNDLE_VERSION="${VERSION//+/-}"
+          BUNDLE_VERSION="${BUNDLE_VERSION//_/-}"
+
+          {
+            echo "version=${VERSION}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "bundle_version=${BUNDLE_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version ${VERSION} | image ${IMAGE_TAG} | bundle ${BUNDLE_VERSION}"
+          {
+            echo "| version | \`${VERSION}\` |"
+            echo "| bundle version | \`${BUNDLE_VERSION}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Quality gates. Until now deploy.yml had no `needs:` on any check, so a
   # commit could deploy to the prod bucket with zero checks having run - provable
@@ -446,10 +463,9 @@ jobs:
 
       - name: Publish artifact bundle
         env:
-          VERSION: ${{ needs.version.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
         run: |
           set -euo pipefail
           bash .github/scripts/publish_bundle.sh "${VERSION}"
@@ -486,10 +502,9 @@ jobs:
       # its own DAGs on a shared Composer bucket.
       - name: Fetch the published bundle
         env:
-          VERSION: ${{ needs.version.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
         run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
 
       - name: Deploy DAGs
@@ -527,10 +542,9 @@ jobs:
       # invisible to Airflow.
       - name: Fetch the published bundle
         env:
-          VERSION: ${{ needs.version.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
         run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
 
       - name: Deploy dbt project
@@ -565,10 +579,9 @@ jobs:
 
       - name: Fetch the published bundle
         env:
-          VERSION: ${{ needs.version.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
         run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
 
       - name: Deploy configs
@@ -603,10 +616,9 @@ jobs:
 
       - name: Fetch the published bundle
         env:
-          VERSION: ${{ needs.version.outputs.image_tag }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
-          BUNDLE_REPO: ${{ env.BUNDLE_REPO }}
         run: bash .github/scripts/fetch_bundle.sh "${VERSION}" _bundle
 
       - name: Deploy job definitions
