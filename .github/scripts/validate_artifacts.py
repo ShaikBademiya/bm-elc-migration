@@ -167,9 +167,29 @@ def stage_dag_structure(report: Report) -> None:
 # ---------------------------------------------------------------- stage 3
 
 
+def job_key(path: Path, subdir: str) -> str:
+    """Identify the job a file belongs to, relative to its artifact class root.
+
+    Two layouts have to work. Flat - ``artifacts/configs/orders.yaml`` - where
+    the stem is the job name. And nested, which is what TRD-002 :461 specifies -
+    ``artifacts/configs/{job}/config.yaml`` - where every stem is the literal
+    string "config", so keying on the stem would collapse every job in the repo
+    to a single entry and the coverage report would silently pass.
+    """
+    base = ARTIFACTS / subdir
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        return path.stem
+    # Nested: the first directory under the class root names the job.
+    if len(relative.parts) > 1:
+        return relative.parts[0]
+    return relative.stem
+
+
 def stage_coverage(report: Report) -> None:
-    configs = {p.stem for p in iter_files("configs", (".yml", ".yaml"))}
-    dags = {p.stem for p in iter_files("dags", (".py",))}
+    configs = {job_key(p, "configs") for p in iter_files("configs", (".yml", ".yaml"))}
+    dags = {job_key(p, "dags") for p in iter_files("dags", (".py",))}
 
     for name in sorted(configs - dags):
         report.warn(f"config '{name}' has no matching DAG (expected during development)")
