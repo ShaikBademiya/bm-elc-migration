@@ -230,6 +230,7 @@ wheels = [
 
 [[package]]
 name = "amf"
+version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
@@ -294,12 +295,12 @@ full = [
 [package.metadata]
 requires-dist = [
     { name = "adal", marker = "extra == 'full'", specifier = ">=1.2" },
-    { name = "amf", extras = ["agents", "cluster", "dashboard", "dbt"], marker = "extra == 'full'" },
+    { name = "amf", extras = ["cluster", "agents", "dbt", "dashboard"], marker = "extra == 'full'" },
     { name = "amf", extras = ["full"], marker = "extra == 'dev'" },
     { name = "anthropic", marker = "extra == 'agents'", specifier = ">=0.52" },
     { name = "boto3", marker = "extra == 'full'", specifier = ">=1.41.5" },
     { name = "certifi", specifier = ">=2024.0" },
-    { name = "databricks-sdk", marker = "extra == 'cluster'", specifier = ">=0.28" },
+    { name = "databricks-sdk", marker = "extra == 'cluster'", specifier = ">=0.122.0" },
     { name = "databricks-sql-connector", marker = "extra == 'full'", specifier = ">=3.0.0" },
     { name = "dbt-bigquery", marker = "extra == 'dbt'", specifier = ">=1.8" },
     { name = "dlt", extras = ["bigquery", "filesystem"], marker = "extra == 'cluster'", specifier = ">=1.4" },
@@ -722,16 +723,17 @@ wheels = [
 
 [[package]]
 name = "databricks-sdk"
-version = "0.111.0"
+version = "0.122.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-auth" },
     { name = "protobuf" },
     { name = "requests" },
+    { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6e/b9/a103cc48691d9391138a0e5bf78487058de3d3d8da58b866673d05f3bd57/databricks_sdk-0.111.0.tar.gz", hash = "sha256:10a50de0709f633b13366522a9750448b0d4831d951a8ae8ee3dd2086fbe8636", size = 954398, upload-time = "2026-05-25T09:29:59.576Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/7d/e3e34005d835c88df348187414837e34981d8eaec29bf91abd36a6f5e39f/databricks_sdk-0.122.0.tar.gz", hash = "sha256:eb11be13f0c02fc4ffc6e2672ad47478ce26ac4b310bd26916af8ba56e374e98", size = 1024752, upload-time = "2026-07-21T09:24:15.952Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e3/43/33806117fc8e0992aae890be73990b31d802b66e8a423bf87b80990fce66/databricks_sdk-0.111.0-py3-none-any.whl", hash = "sha256:d14ba186afd2bea03c7157d2f03e0f861a0b8eff528cfdba926d07b9e20384b8", size = 901536, upload-time = "2026-05-25T09:29:58.057Z" },
+    { url = "https://files.pythonhosted.org/packages/28/95/f17887b43ac4dcc09079e5fb0e93374762d85d593c8e5114dbc6f82b6c52/databricks_sdk-0.122.0-py3-none-any.whl", hash = "sha256:7d998ec47f580be6be1cfe066be78038054767575b7437af5e4f76b67dde49c2", size = 969097, upload-time = "2026-07-21T09:24:14.32Z" },
 ]
 
 [[package]]
