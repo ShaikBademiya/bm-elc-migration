@@ -1,4 +1,4 @@
-name: Deploy to Dev
+name: Deploy
 
 on:
   push:
@@ -30,6 +30,13 @@ env:
 # Two pushes in quick succession would otherwise run overlapping rsyncs against
 # the same GCS prefixes. Queue rather than cancel: a half-finished deploy that
 # gets cancelled mid-sync leaves the bucket in an unknown state.
+# Least privilege. id-token is requested so the auth step can move to Workload
+# Identity Federation without restructuring this workflow; nothing here needs
+# write access to repository contents.
+permissions:
+  contents: read
+  id-token: write
+
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -91,10 +98,13 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
+            # Code only. artifacts/configs and artifacts/jobs are data and are
+            # covered by the configs_jobs filter below. Including them here
+            # rebuilt and republished a byte-identical wheel and image on every
+            # config-only change - the config/code coupling ADR-006 Decision 2
+            # exists to remove.
             python:
               - 'amf/core/**'
-              - 'artifacts/configs/**'
-              - 'artifacts/jobs/**'
               - 'pyproject.toml'
               - 'uv.lock'
               - 'databricks.yml'
@@ -159,7 +169,6 @@ jobs:
   deploy-artifact-registry-python:
     runs-on: ubuntu-latest
     needs: [setup, build-wheel]
-    if: needs.build-wheel.result == 'success'
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
@@ -203,7 +212,6 @@ jobs:
 
     needs: [setup, build-wheel]
 
-    if: needs.build-wheel.result == 'success'
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
@@ -245,13 +253,16 @@ jobs:
           VERSION: ${{ needs.build-wheel.outputs.version }}
 
         run: |
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf:${VERSION}"
+          BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
-          echo "Building image:"
-          echo "${IMAGE}"
+          # 0.0.<run_number> carries no link back to the code that produced it,
+          # so the commit sha goes on as a second tag. Without it there is no
+          # way to answer "which commit is running here".
+          echo "Building ${BASE}:${VERSION} (also tagged ${GITHUB_SHA})"
 
           docker build \
-            -t "${IMAGE}" \
+            -t "${BASE}:${VERSION}" \
+            -t "${BASE}:${GITHUB_SHA}" \
             .
 
       - name: Push Docker image
@@ -262,12 +273,12 @@ jobs:
           VERSION: ${{ needs.build-wheel.outputs.version }}
 
         run: |
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf:${VERSION}"
+          BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
-          echo "Pushing image:"
-          echo "${IMAGE}"
+          echo "Pushing ${BASE}:${VERSION} and ${BASE}:${GITHUB_SHA}"
 
-          docker push "${IMAGE}"
+          docker push "${BASE}:${VERSION}"
+          docker push "${BASE}:${GITHUB_SHA}"
 
   deploy-dags:
     runs-on: ubuntu-latest
