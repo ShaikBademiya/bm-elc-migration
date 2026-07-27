@@ -243,28 +243,30 @@ jobs:
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
       # Composer actually mounts (dags/ or data/), namespaced by domain so a
       # destructive sync cannot reach another domain on a shared bucket.
-      - name: Sync DAGs
-        run: |
-          gsutil -m rsync -r -d \
-            artifacts/dags/ gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+      # A release reconciles every artifact rather than applying a diff: it is
+      # promoting a tagged state, not a change set. Same script as deploy.yml so
+      # there is one deploy mechanism, and `full` mode never passes -d, so a
+      # release cannot delete another domain's files from a shared bucket
+      # (TRD-002 :576).
+      - name: Deploy DAGs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" full
 
-      - name: Sync dbt project
-        run: |
-          gsutil -m rsync -r -d \
-            artifacts/dbt/ gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+      - name: Deploy dbt project
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" full
 
-      # Non-destructive by design: TRD-002 (:576) keeps configs without -d so a
-      # release does not delete another domain's configs from a shared bucket.
-      - name: Sync configs and jobs
-        run: |
-          if [ -d artifacts/configs ]; then
-            gsutil -m rsync -r \
-              artifacts/configs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
-          fi
-          if [ -d artifacts/jobs ]; then
-            gsutil -m rsync -r \
-              artifacts/jobs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
-          fi
+      - name: Deploy configs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" full
+
+      - name: Deploy job definitions
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" full
 
   github-release:
     name: Create GitHub release
