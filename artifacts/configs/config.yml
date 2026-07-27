@@ -1,1 +1,3 @@
+# POC deployment marker - verifies deploy-configs-jobs reaches the environment's Composer bucket.
+# Expected destination: gs://<COMPOSER_BUCKET>/configs/
 # Test config yaml file
