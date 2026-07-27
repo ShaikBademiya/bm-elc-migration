@@ -18,6 +18,12 @@ on:
       - 'uv.lock'
       - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      full_deploy:
+        description: 'Reconcile every artifact instead of deploying only changed files'
+        required: false
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -26,10 +32,9 @@ env:
   # shared Composer bucket. Matches the dags/udp/ convention in TRD-002 :569 and
   # the dags/${domain_name}/ convention already used by etp-etl-core.
   DOMAIN: udp
-  # A destructive sync that would remove more than this share of the objects
-  # currently in the destination prefix is treated as a bad diff, not an intent
-  # to delete. See the guard in the sync jobs.
-  MAX_DELETE_RATIO: 50
+  # Upper bound on deletions in a single run, enforced by deploy_artifacts.sh.
+  # A larger removal is treated as a bad diff rather than an intent to delete.
+  MAX_DELETIONS: 25
 
 # Least privilege. id-token is requested so the auth step can move to Workload
 # Identity Federation without restructuring this workflow; nothing here needs
@@ -40,7 +45,7 @@ permissions:
 
 # Keyed on the branch, and shared with release.yml, because both write to the
 # same Composer prefixes. Queue rather than cancel: a deploy cancelled midway
-# through an rsync leaves the bucket in an unknown state. `queue: max` cannot be
+# through a deploy leaves the bucket in an unknown state. `queue: max` cannot be
 # combined with cancel-in-progress: true.
 concurrency:
   group: composer-deploy-${{ github.ref_name }}
@@ -94,6 +99,11 @@ jobs:
 
     outputs:
       python: ${{ steps.filter.outputs.python }}
+      # "full" means the diff could not be trusted, so the deploy jobs must
+      # reconcile the whole directory instead of applying a change set that may
+      # be empty or wrong.
+      full: ${{ steps.filter.outputs.full }}
+      manifest: ${{ steps.filter.outputs.manifest }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,50 +126,68 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
+          FORCE_FULL: ${{ inputs.full_deploy }}
         run: |
           set -euo pipefail
 
-          if [ -z "${BEFORE}" ] \
-             || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            # New branch, workflow_dispatch, or a force-push that orphaned the
-            # old tip. Fall back to the first parent.
-            BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo "${HEAD_SHA}")"
-            echo "No usable previous commit; comparing against ${BASE_SHA}"
+          FULL=false
+          BASE_SHA="${HEAD_SHA}"
+
+          if [ "${FORCE_FULL:-false}" = "true" ]; then
+            FULL=true
+            echo "full_deploy requested - reconciling every artifact"
+          elif [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            FULL=true
+            echo "No previous commit (new branch or manual run) - reconciling"
+          elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            FULL=true
+            echo "Previous commit ${BEFORE} is unreachable (force-push) - reconciling"
           else
             BASE_SHA="${BEFORE}"
             echo "Comparing ${BASE_SHA}..${HEAD_SHA}"
           fi
 
-          if [ "${BASE_SHA}" = "${HEAD_SHA}" ]; then
-            CHANGED=""
-          else
-            CHANGED="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          # -M so a rename is reported as R<score> old new, letting the deploy
+          # remove the old object instead of orphaning it.
+          MANIFEST=""
+          if [ "${FULL}" = "false" ]; then
+            MANIFEST="$(git diff --name-status -M "${BASE_SHA}" "${HEAD_SHA}")"
           fi
 
-          echo "--- changed files ---"
-          echo "${CHANGED}"
-          echo "---------------------"
+          if [ "${FULL}" = "true" ]; then
+            PY=true
+          elif echo "${MANIFEST}" | grep -qE '^[A-Z][0-9]*[[:space:]]+(amf/core/|pyproject\.toml|uv\.lock|databricks\.yml)'; then
+            PY=true
+          else
+            PY=false
+          fi
 
-          has() {
-            if printf '%s\n' "${CHANGED}" | grep -qE "$1"; then echo true; else echo false; fi
-          }
+          CHANGE_COUNT="$(echo "${MANIFEST}" | grep -c . || true)"
 
-          PY="$(has '^(amf/core/|pyproject\.toml$|uv\.lock$|databricks\.yml$)')"
+          echo "--- manifest ---"
+          echo "${MANIFEST}"
+          echo "----------------"
 
           {
             echo "base_sha=${BASE_SHA}"
+            echo "full=${FULL}"
             echo "python=${PY}"
+            echo "manifest<<MANIFEST_EOF"
+            echo "${MANIFEST}"
+            echo "MANIFEST_EOF"
           } >> "$GITHUB_OUTPUT"
 
           # Surfaced in the summary, not buried in a collapsed log group - the
           # original defect went unnoticed for 34 runs because the diff base was
           # only visible inside ##[group].
+          if [ "${FULL}" = "true" ]; then MODE=full-reconciliation; else MODE=incremental; fi
           {
             echo "| Detection | Value |"
             echo "| --- | --- |"
             echo "| base sha | \`${BASE_SHA}\` |"
             echo "| head sha | \`${HEAD_SHA}\` |"
+            echo "| mode | \`${MODE}\` |"
+            echo "| changed files | \`${CHANGE_COUNT}\` |"
             echo "| rebuild wheel/image | \`${PY}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -371,16 +399,18 @@ jobs:
           docker push "${BASE}:${VERSION}"
           docker push "${BASE}:${GITHUB_SHA}"
 
-  # The three sync jobs below are deliberately NOT gated on `changes`.
+  # The deploy jobs below apply the manifest from `changes` file by file, rather
+  # than replacing the whole destination prefix. Only what changed is copied, and
+  # only what was deleted is removed.
   #
-  # rsync is convergent and cheap, so gating it buys nothing, while a wrong
-  # diff silently skips a deploy and still reports success. Gating is reserved
-  # for the expensive wheel and image build above. This makes zero-detection
-  # harmless instead of dangerous.
+  # They consume the diff, so a wrong diff matters. That is handled at the source:
+  # `changes` emits full=true whenever the diff cannot be trusted (new branch,
+  # manual run, force-push), and full mode reconciles the directory instead. An
+  # unreliable diff therefore over-deploys rather than silently deploying nothing.
   deploy-dags:
-    name: Sync DAGs
+    name: Deploy DAGs
     runs-on: ubuntu-latest
-    needs: [setup, quality, artifacts-valid]
+    needs: [setup, changes, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
@@ -396,32 +426,23 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
-      # ever delete this domain's DAGs. Against a shared Composer bucket an
-      # un-namespaced `rsync -d` at dags/ would delete every other domain's tree.
-      - name: Guard against a mass deletion
-        env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
-        run: |
-          set -euo pipefail
-          LOCAL=$(find artifacts/dags -type f | wc -l)
-          REMOTE=$(gsutil ls -r "${DEST}**" 2>/dev/null | grep -c '^gs://' || true)
-          echo "local=${LOCAL} remote=${REMOTE}"
-          if [ "${REMOTE}" -gt 0 ] && [ "${LOCAL}" -lt $(( REMOTE * (100 - MAX_DELETE_RATIO) / 100 )) ]; then
-            echo "::error::Refusing to sync: ${LOCAL} local file(s) against ${REMOTE} remote."
-            echo "::error::A destructive sync would remove more than ${MAX_DELETE_RATIO}% of the destination."
-            exit 1
-          fi
 
-      - name: Sync DAGs to Composer
+      # Namespaced under dags/<domain>/ so this domain can only ever touch
+      # its own DAGs on a shared Composer bucket.
+      - name: Deploy DAGs
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
         run: |
-          gsutil -m rsync -r -d \
-            artifacts/dags/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" "$MODE"
 
   deploy-dbt:
-    name: Sync dbt project
+    name: Deploy dbt project
     runs-on: ubuntu-latest
-    needs: [setup, quality, artifacts-valid]
+    needs: [setup, changes, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
@@ -438,32 +459,23 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      - name: Guard against a mass deletion
+      # data/ is the only prefix besides dags/ that Composer mounts into
+      # workers (as /home/airflow/gcs/data). A top-level dbt/ prefix is
+      # invisible to Airflow.
+      - name: Deploy dbt project
         env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
         run: |
-          set -euo pipefail
-          LOCAL=$(find artifacts/dbt -type f | wc -l)
-          REMOTE=$(gsutil ls -r "${DEST}**" 2>/dev/null | grep -c '^gs://' || true)
-          echo "local=${LOCAL} remote=${REMOTE}"
-          if [ "${REMOTE}" -gt 0 ] && [ "${LOCAL}" -lt $(( REMOTE * (100 - MAX_DELETE_RATIO) / 100 )) ]; then
-            echo "::error::Refusing to sync: ${LOCAL} local file(s) against ${REMOTE} remote."
-            exit 1
-          fi
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" "$MODE"
 
-      # data/ is the only prefix besides dags/ that Composer mounts into workers
-      # (as /home/airflow/gcs/data). A top-level dbt/ prefix is invisible to
-      # Airflow, so dbt tasks would never find the project.
-      - name: Sync dbt project
-        run: |
-          gsutil -m rsync -r -d \
-            artifacts/dbt/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
-
-  deploy-configs-jobs:
-    name: Sync configs and jobs
+  deploy-configs:
+    name: Deploy configs
     runs-on: ubuntu-latest
-    needs: [setup, quality, artifacts-valid]
+    needs: [setup, changes, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
@@ -479,25 +491,43 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
-      # so deploying one domain cannot delete another domain's configs. Removing
-      # a config is therefore an explicit `gsutil rm`, not a side effect. No
-      # deletion guard is needed here for the same reason.
-      - name: Sync config files
-        run: |
-          if [ -d artifacts/configs ]; then
-            gsutil -m rsync -r \
-              artifacts/configs/ \
-              gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
-          else
-            echo "artifacts/configs does not exist - nothing to sync"
-          fi
 
-      - name: Sync job files
+      - name: Deploy configs
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
         run: |
-          if [ -d artifacts/jobs ]; then
-            gsutil -m rsync -r \
-              artifacts/jobs/ \
-              gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
-          else
-            echo "artifacts/jobs does not exist - nothing to sync"
-          fi
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" "$MODE"
+
+  deploy-jobs:
+    name: Deploy job definitions
+    runs-on: ubuntu-latest
+    needs: [setup, changes, quality, artifacts-valid]
+    timeout-minutes: 15
+
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Deploy job definitions
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
+        run: |
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" "$MODE"

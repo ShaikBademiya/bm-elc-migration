@@ -42,19 +42,14 @@ def check(path: Path) -> list[str]:
 
     problems: list[str] = []
     lines = path.read_text(encoding="utf-8").splitlines()
-
-    # rsync invocations often wrap, so keep the destructive flag sticky until we
-    # find the destination it applies to.
-    destructive = False
+    found = 0
 
     for number, line in enumerate(lines, 1):
-        if "rsync" in line:
-            destructive = bool(re.search(r"rsync\b.*(-r -d|-d\b|-rd\b)", line))
-
         match = DESTINATION.search(line)
         if not match:
             continue
 
+        found += 1
         target = match.group("path")
 
         if not target.startswith(MOUNTED_PREFIXES):
@@ -63,13 +58,23 @@ def check(path: Path) -> list[str]:
                 "Composer will not mount it"
             )
 
-        if destructive and DOMAIN_REF not in line:
+        # Every destination must be domain-scoped, not only the destructive ones.
+        # Deploys now go file-by-file via deploy_artifacts.sh, which deletes
+        # removed files, so any un-namespaced destination can reach another
+        # domain's objects on a shared bucket.
+        if DOMAIN_REF not in line:
             problems.append(
-                f"{path.name}:{number}: destructive rsync into '{target}' is not "
-                "domain-namespaced; on a shared bucket this deletes other domains' files"
+                f"{path.name}:{number}: destination '{target}' is not domain-namespaced; "
+                "on a shared bucket this can reach other domains' files"
             )
 
-        destructive = False
+    # A silent zero-match would let this gate pass on a workflow whose
+    # destinations had been restructured out from under it.
+    if found == 0:
+        problems.append(
+            f"{path.name}: no COMPOSER_BUCKET destination found - the checker's pattern "
+            "no longer matches this workflow and is not validating anything"
+        )
 
     return problems
 

@@ -72,10 +72,10 @@ jobs:
           status=0
           for dir in artifacts/dags artifacts/dbt artifacts/configs artifacts/jobs; do
             if [ ! -d "$dir" ]; then
-              echo "::error::$dir is missing - deploy-configs-jobs and friends will fail on rsync"
+              echo "::error::$dir is missing - its deploy job has nothing to publish"
               status=1
             elif [ -z "$(find "$dir" -type f -print -quit)" ]; then
-              echo "::error::$dir is empty - a destructive rsync would clear its Composer prefix"
+              echo "::error::$dir is empty - a full reconciliation would publish nothing"
               status=1
             else
               echo "$dir: $(find "$dir" -type f | wc -l) file(s)"
@@ -84,8 +84,8 @@ jobs:
           exit $status
 
       # Composer mounts only gs://<bucket>/dags and gs://<bucket>/data into
-      # workers, and a destructive rsync is only safe inside a prefix this
-      # domain owns. Both failures are invisible at runtime because gsutil
+      # workers, and a deploy that removes files is only safe inside a prefix
+      # this domain owns. Both failures are invisible at runtime because gsutil
       # reports success either way, so they have to be caught statically.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
