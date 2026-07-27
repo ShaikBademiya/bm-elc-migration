@@ -33,7 +33,7 @@ jobs:
         id: set-env
         run: |
           case "${GITHUB_REF_NAME}" in
-            dev)
+            master)
               ENVIRONMENT="dev"
               ;;
             ust)
