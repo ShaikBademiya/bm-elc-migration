@@ -120,16 +120,15 @@ jobs:
       name: prod
 
     steps:
+      # Check out the tag itself. setuptools-scm reads the version from the
+      # nearest tag, so building the tagged commit is what produces a clean
+      # X.Y.Z rather than a .devN+g<sha>.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ needs.tag.outputs.tag }}
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
-
-      - name: Stamp release version
-        run: |
-          sed -i "s/^version = \".*\"/version = \"${{ needs.tag.outputs.version }}\"/" pyproject.toml
-          grep '^version' pyproject.toml
 
       - name: Build wheel
         run: uv build --wheel
@@ -161,7 +160,8 @@ jobs:
         run: |
           pip install twine keyring keyrings.google-artifactregistry-auth
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
-          python -m twine upload --verbose \
+          # Re-running a workflow rebuilds the same version; without --skip-existing the upload hard-fails with a 400 and the deploy goes red.
+          python -m twine upload --verbose --skip-existing \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
 

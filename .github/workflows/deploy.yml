@@ -193,8 +193,11 @@ jobs:
 
     outputs:
       version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
 
     steps:
+      # fetch-depth: 0 is required, not merely convenient: setuptools-scm derives
+      # the version from the nearest tag, and a shallow clone has none.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
@@ -202,18 +205,38 @@ jobs:
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
-      - name: Set package version
-        id: version
-        run: |
-          VERSION="0.0.${GITHUB_RUN_NUMBER}"
-          echo "Package version: ${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
-          echo "Updated pyproject.toml:"
-          grep '^version' pyproject.toml
-
       - name: Build wheel
         run: uv build --wheel
+
+      # Read the version off the artifact rather than computing it separately -
+      # the filename is the authoritative answer to "what did we just build".
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl | head -1)"
+          VERSION="$(basename "${WHEEL}" | cut -d- -f2)"
+
+          # PEP 440 local segments use '+', which is not a legal character in a
+          # Docker tag ([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}). Substituting it keeps
+          # the sha visible in the tag instead of dropping the local segment.
+          IMAGE_TAG="${VERSION//+/_}"
+
+          echo "wheel     : ${WHEEL}"
+          echo "version   : ${VERSION}"
+          echo "image tag : ${IMAGE_TAG}"
+
+          {
+            echo "version=${VERSION}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "| Artifact | Value |"
+            echo "| --- | --- |"
+            echo "| wheel version | \`${VERSION}\` |"
+            echo "| image tag | \`${IMAGE_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -260,7 +283,8 @@ jobs:
         run: |
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
 
-          python -m twine upload --verbose \
+          # Re-running a workflow rebuilds the same version; without --skip-existing the upload hard-fails with a 400 and the deploy goes red.
+          python -m twine upload --verbose --skip-existing \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
 
@@ -305,7 +329,7 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.version }}
+          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
@@ -324,7 +348,7 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.version }}
+          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
           echo "Pushing ${BASE}:${VERSION} and ${BASE}:${GITHUB_SHA}"
