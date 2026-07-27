@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = [
     ROOT / ".github" / "workflows" / "deploy.yml",
     ROOT / ".github" / "workflows" / "release.yml",
+    ROOT / ".github" / "workflows" / "promote.yml",
 ]
 
 # Matches a gsutil destination built from the COMPOSER_BUCKET secret, capturing
