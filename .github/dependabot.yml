@@ -1,0 +1,31 @@
+version: 2
+
+# Pinning actions to a commit SHA is the supply-chain control (see the
+# tj-actions/changed-files compromise, where a mutable tag was repointed to
+# exfiltrate secrets). Pinning without automated updates just converts a
+# supply-chain risk into an unpatched-dependency risk, so the two go together:
+# Dependabot raises a PR with the new SHA and the version in a comment.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - '*'
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python

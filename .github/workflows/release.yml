@@ -33,9 +33,13 @@ on:
 permissions:
   contents: read
 
+# Shares deploy.yml's group: both write to the same Composer prefixes, so a
+# release and a branch deploy must never interleave. ref_name keys it to the
+# branch the release is cut from.
 concurrency:
-  group: release
+  group: composer-deploy-${{ github.ref_name }}
   cancel-in-progress: false
+  queue: max
 
 env:
   # Must match deploy.yml, or a release would write to different prefixes than
@@ -46,6 +50,7 @@ jobs:
   tag:
     name: Compute version and tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     permissions:
       contents: write
@@ -107,6 +112,7 @@ jobs:
   publish:
     name: Publish versioned artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: tag
 
     # Blocks until a reviewer approves, once protection rules are configured.
@@ -179,6 +185,7 @@ jobs:
   deploy-databricks:
     name: Deploy Databricks bundle
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [tag, publish]
 
     environment:
@@ -203,6 +210,7 @@ jobs:
   deploy-composer:
     name: Sync artifacts to prod Composer bucket
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [tag, publish]
     if: ${{ !inputs.dry_run }}
 
@@ -247,6 +255,7 @@ jobs:
   github-release:
     name: Create GitHub release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [tag, publish, deploy-composer]
     if: ${{ !inputs.dry_run }}
 
