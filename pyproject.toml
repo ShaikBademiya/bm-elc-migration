@@ -55,7 +55,7 @@ line-length = 100
 exclude = ["reference/", "source_repo/", "tests/pbi_smoke/"]
 
 [tool.setuptools.packages.find]
-include = ["amf.core*", "amf.models*"]
+include = ["amf.core*"]
 
 [tool.setuptools.package-data]
 "*" = ["**/*.yaml", "**/*.json", "**/*.dax"]
