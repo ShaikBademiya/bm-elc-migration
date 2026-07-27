@@ -26,10 +26,11 @@ env:
   # shared Composer bucket. Matches the dags/udp/ convention in TRD-002 :569 and
   # the dags/${domain_name}/ convention already used by etp-etl-core.
   DOMAIN: udp
+  # A destructive sync that would remove more than this share of the objects
+  # currently in the destination prefix is treated as a bad diff, not an intent
+  # to delete. See the guard in the sync jobs.
+  MAX_DELETE_RATIO: 50
 
-# Two pushes in quick succession would otherwise run overlapping rsyncs against
-# the same GCS prefixes. Queue rather than cancel: a half-finished deploy that
-# gets cancelled mid-sync leaves the bucket in an unknown state.
 # Least privilege. id-token is requested so the auth step can move to Workload
 # Identity Federation without restructuring this workflow; nothing here needs
 # write access to repository contents.
@@ -37,13 +38,20 @@ permissions:
   contents: read
   id-token: write
 
+# Keyed on the branch, and shared with release.yml, because both write to the
+# same Composer prefixes. Queue rather than cancel: a deploy cancelled midway
+# through an rsync leaves the bucket in an unknown state. `queue: max` cannot be
+# combined with cancel-in-progress: true.
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: composer-deploy-${{ github.ref_name }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   setup:
+    name: Resolve environment
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     outputs:
       environment: ${{ steps.set-env.outputs.environment }}
@@ -72,60 +80,95 @@ jobs:
           esac
 
           echo "Resolved deployment environment: ${ENVIRONMENT}"
-
           echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "### Deploying to \`${ENVIRONMENT}\` from \`${GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
 
-
+  # No `environment:` here deliberately. This job touches nothing and holds no
+  # credentials, and once a required reviewer exists on an environment, every
+  # job bound to it raises its own approval prompt.
   changes:
+    name: Detect changed paths
     runs-on: ubuntu-latest
     needs: setup
-
-    environment:
-      name: ${{ needs.setup.outputs.environment }}
+    timeout-minutes: 10
 
     outputs:
       python: ${{ steps.filter.outputs.python }}
-      dags: ${{ steps.filter.outputs.dags }}
-      dbt: ${{ steps.filter.outputs.dbt }}
-      configs_jobs: ${{ steps.filter.outputs.configs_jobs }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            # Code only. artifacts/configs and artifacts/jobs are data and are
-            # covered by the configs_jobs filter below. Including them here
-            # rebuilt and republished a byte-identical wheel and image on every
-            # config-only change - the config/code coupling ADR-006 Decision 2
-            # exists to remove.
-            python:
-              - 'amf/core/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - 'databricks.yml'
+      # Deliberately NOT dorny/paths-filter. That action defaults `base` to the
+      # repository default branch, so on any other branch it diffs from
+      # merge-base(default, current) rather than from the previous commit. On
+      # `main` that produced false positives on every run, and after an ordinary
+      # merge commit it produces the opposite - zero detected changes, every
+      # deploy job skipped, and a green run that deployed nothing.
+      #
+      # This is the estate's approach (etp-etl-core/dev.yml:63-91): diff against
+      # github.event.before, with an explicit fallback. It has no fork-point
+      # concept and cannot exhibit either failure.
+      - name: Detect changed paths
+        id: filter
+        env:
+          BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
 
-            dags:
-              - 'artifacts/dags/**'
+          if [ -z "${BEFORE}" ] \
+             || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            # New branch, workflow_dispatch, or a force-push that orphaned the
+            # old tip. Fall back to the first parent.
+            BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo "${HEAD_SHA}")"
+            echo "No usable previous commit; comparing against ${BASE_SHA}"
+          else
+            BASE_SHA="${BEFORE}"
+            echo "Comparing ${BASE_SHA}..${HEAD_SHA}"
+          fi
 
-            dbt:
-              - 'artifacts/dbt/**'
+          if [ "${BASE_SHA}" = "${HEAD_SHA}" ]; then
+            CHANGED=""
+          else
+            CHANGED="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          fi
 
-            configs_jobs:
-              - 'artifacts/configs/**'
-              - 'artifacts/jobs/**'
+          echo "--- changed files ---"
+          echo "${CHANGED}"
+          echo "---------------------"
+
+          has() {
+            if printf '%s\n' "${CHANGED}" | grep -qE "$1"; then echo true; else echo false; fi
+          }
+
+          PY="$(has '^(amf/core/|pyproject\.toml$|uv\.lock$|databricks\.yml$)')"
+
+          {
+            echo "base_sha=${BASE_SHA}"
+            echo "python=${PY}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Surfaced in the summary, not buried in a collapsed log group - the
+          # original defect went unnoticed for 34 runs because the diff base was
+          # only visible inside ##[group].
+          {
+            echo "| Detection | Value |"
+            echo "| --- | --- |"
+            echo "| base sha | \`${BASE_SHA}\` |"
+            echo "| head sha | \`${HEAD_SHA}\` |"
+            echo "| rebuild wheel/image | \`${PY}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-wheel:
+    name: Build wheel
     runs-on: ubuntu-latest
     needs: [setup, changes]
     if: needs.changes.outputs.python == 'true'
-
-    environment:
-      name: ${{ needs.setup.outputs.environment }}
+    timeout-minutes: 15
 
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -134,31 +177,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@v6
 
       - name: Set package version
         id: version
         run: |
-            VERSION="0.0.${GITHUB_RUN_NUMBER}"
-
-            echo "Package version: ${VERSION}"
-
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-            sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
-
-            echo "Updated pyproject.toml:"
-            grep '^version' pyproject.toml
+          VERSION="0.0.${GITHUB_RUN_NUMBER}"
+          echo "Package version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+          echo "Updated pyproject.toml:"
+          grep '^version' pyproject.toml
 
       - name: Build wheel
         run: uv build --wheel
-
-      # Optional: Inspect the generated wheel files for debugging purposes
-      # - name: Inspect generated wheel
-      #   run: |
-      #       echo "Generated wheel files:"
-      #       ls -lh dist/
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -167,8 +201,10 @@ jobs:
           path: dist/*.whl
 
   deploy-artifact-registry-python:
+    name: Publish wheel to Artifact Registry
     runs-on: ubuntu-latest
     needs: [setup, build-wheel]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
@@ -208,17 +244,18 @@ jobs:
             dist/*.whl
 
   deploy-artifact-registry-docker:
+    name: Publish image to Artifact Registry
     runs-on: ubuntu-latest
-
     needs: [setup, build-wheel]
-
+    timeout-minutes: 30
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
@@ -231,19 +268,16 @@ jobs:
           echo "Wheel used for Docker image:"
           ls -lh dist/
 
-
       - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/setup-gcloud@v2
 
-
       - name: Configure Docker authentication
         run: |
           gcloud auth configure-docker \
-            ${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev
-
+            "${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev" --quiet
 
       - name: Build Docker image
         env:
@@ -251,7 +285,6 @@ jobs:
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
           VERSION: ${{ needs.build-wheel.outputs.version }}
-
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
@@ -271,25 +304,31 @@ jobs:
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
           VERSION: ${{ needs.build-wheel.outputs.version }}
-
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
-
           echo "Pushing ${BASE}:${VERSION} and ${BASE}:${GITHUB_SHA}"
-
           docker push "${BASE}:${VERSION}"
           docker push "${BASE}:${GITHUB_SHA}"
 
+  # The three sync jobs below are deliberately NOT gated on `changes`.
+  #
+  # rsync is convergent and cheap, so gating it buys nothing, while a wrong
+  # diff silently skips a deploy and still reports success. Gating is reserved
+  # for the expensive wheel and image build above. This makes zero-detection
+  # harmless instead of dangerous.
   deploy-dags:
+    name: Sync DAGs
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.dags == 'true'
+    needs: [setup]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@v2
         with:
@@ -297,9 +336,23 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      # Namespaced under dags/<domain>/ so the destructive -d below can only ever
-      # delete this domain's DAGs. Against a shared Composer bucket an
+      # Namespaced under dags/<domain>/ so the destructive -d below can only
+      # ever delete this domain's DAGs. Against a shared Composer bucket an
       # un-namespaced `rsync -d` at dags/ would delete every other domain's tree.
+      - name: Guard against a mass deletion
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+        run: |
+          set -euo pipefail
+          LOCAL=$(find artifacts/dags -type f | wc -l)
+          REMOTE=$(gsutil ls -r "${DEST}**" 2>/dev/null | grep -c '^gs://' || true)
+          echo "local=${LOCAL} remote=${REMOTE}"
+          if [ "${REMOTE}" -gt 0 ] && [ "${LOCAL}" -lt $(( REMOTE * (100 - MAX_DELETE_RATIO) / 100 )) ]; then
+            echo "::error::Refusing to sync: ${LOCAL} local file(s) against ${REMOTE} remote."
+            echo "::error::A destructive sync would remove more than ${MAX_DELETE_RATIO}% of the destination."
+            exit 1
+          fi
+
       - name: Sync DAGs to Composer
         run: |
           gsutil -m rsync -r -d \
@@ -307,21 +360,37 @@ jobs:
             gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
 
   deploy-dbt:
+    name: Sync dbt project
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.dbt == 'true'
+    needs: [setup]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Guard against a mass deletion
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+        run: |
+          set -euo pipefail
+          LOCAL=$(find artifacts/dbt -type f | wc -l)
+          REMOTE=$(gsutil ls -r "${DEST}**" 2>/dev/null | grep -c '^gs://' || true)
+          echo "local=${LOCAL} remote=${REMOTE}"
+          if [ "${REMOTE}" -gt 0 ] && [ "${LOCAL}" -lt $(( REMOTE * (100 - MAX_DELETE_RATIO) / 100 )) ]; then
+            echo "::error::Refusing to sync: ${LOCAL} local file(s) against ${REMOTE} remote."
+            exit 1
+          fi
 
       # data/ is the only prefix besides dags/ that Composer mounts into workers
       # (as /home/airflow/gcs/data). A top-level dbt/ prefix is invisible to
@@ -333,15 +402,18 @@ jobs:
             gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
 
   deploy-configs-jobs:
+    name: Sync configs and jobs
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.configs_jobs == 'true'
+    needs: [setup]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@v2
         with:
@@ -349,13 +421,10 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      # No -d. TRD-002 :576 makes configs a non-destructive sync deliberately, so
-      # deploying one domain cannot delete another domain's configs. Removing a
-      # config is therefore an explicit `gsutil rm`, not a side effect.
-      #
-      # Each directory is guarded: the filter fires when EITHER configs or jobs
-      # changed, but both steps run, and `rsync` hard-fails on a missing source.
-      # That is what broke run 17.
+      # No -d. TRD-002 :576 makes configs a non-destructive sync deliberately,
+      # so deploying one domain cannot delete another domain's configs. Removing
+      # a config is therefore an explicit `gsutil rm`, not a side effect. No
+      # deletion guard is needed here for the same reason.
       - name: Sync config files
         run: |
           if [ -d artifacts/configs ]; then

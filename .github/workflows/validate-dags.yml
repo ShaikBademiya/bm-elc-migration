@@ -28,6 +28,7 @@ jobs:
   validate:
     name: Validate artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +49,7 @@ jobs:
   deployability:
     name: Deployability checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
