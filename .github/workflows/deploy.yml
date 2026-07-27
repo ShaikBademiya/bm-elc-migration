@@ -26,25 +26,35 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      environment: ${{ steps.env.outputs.environment }}
+      environment: ${{ steps.set-env.outputs.environment }}
 
     steps:
-      - id: env
+      - name: Resolve deployment environment
+        id: set-env
         run: |
           case "${GITHUB_REF_NAME}" in
-            msater)
-              echo "environment=dev" >> $GITHUB_OUTPUT
+            dev)
+              ENVIRONMENT="dev"
               ;;
             ust)
-              echo "environment=ust" >> $GITHUB_OUTPUT
+              ENVIRONMENT="ust"
               ;;
             sit)
-              echo "environment=sit" >> $GITHUB_OUTPUT
+              ENVIRONMENT="sit"
               ;;
             main)
-              echo "environment=prod" >> $GITHUB_OUTPUT
+              ENVIRONMENT="prod"
+              ;;
+            *)
+              echo "Unsupported branch: ${GITHUB_REF_NAME}"
+              exit 1
               ;;
           esac
+
+          echo "Resolved deployment environment: ${ENVIRONMENT}"
+
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
 
   changes:
     runs-on: ubuntu-latest
