@@ -16,6 +16,7 @@ on:
       - 'databricks.yml'
       - 'pyproject.toml'
       - 'uv.lock'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 env:
@@ -98,7 +99,7 @@ jobs:
 
   build-wheel:
     runs-on: ubuntu-latest
-    needs: changes
+    needs: [setup, changes]
     if: needs.changes.outputs.python == 'true'
 
     environment:
@@ -145,7 +146,7 @@ jobs:
 
   deploy-artifact-registry-python:
     runs-on: ubuntu-latest
-    needs: build-wheel
+    needs: [setup, build-wheel]
     if: needs.build-wheel.result == 'success'
 
     environment:
@@ -188,7 +189,7 @@ jobs:
   deploy-artifact-registry-docker:
     runs-on: ubuntu-latest
 
-    needs: build-wheel
+    needs: [setup, build-wheel]
 
     if: needs.build-wheel.result == 'success'
 
@@ -258,7 +259,7 @@ jobs:
 
   deploy-dags:
     runs-on: ubuntu-latest
-    needs: changes
+    needs: [setup, changes]
     if: needs.changes.outputs.dags == 'true'
 
     environment:
@@ -281,7 +282,7 @@ jobs:
 
   deploy-dbt:
     runs-on: ubuntu-latest
-    needs: changes
+    needs: [setup, changes]
     if: needs.changes.outputs.dbt == 'true'
 
     environment:
@@ -304,7 +305,7 @@ jobs:
 
   deploy-configs-jobs:
     runs-on: ubuntu-latest
-    needs: changes
+    needs: [setup, changes]
     if: needs.changes.outputs.configs_jobs == 'true'
 
     environment:
