@@ -21,6 +21,18 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Every artifact this repo deploys is written under a prefix owned by this
+  # domain, so a destructive sync can never reach another domain's files on a
+  # shared Composer bucket. Matches the dags/udp/ convention in TRD-002 :569 and
+  # the dags/${domain_name}/ convention already used by etp-etl-core.
+  DOMAIN: udp
+
+# Two pushes in quick succession would otherwise run overlapping rsyncs against
+# the same GCS prefixes. Queue rather than cancel: a half-finished deploy that
+# gets cancelled mid-sync leaves the bucket in an unknown state.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   setup:
@@ -274,11 +286,14 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      # Namespaced under dags/<domain>/ so the destructive -d below can only ever
+      # delete this domain's DAGs. Against a shared Composer bucket an
+      # un-namespaced `rsync -d` at dags/ would delete every other domain's tree.
       - name: Sync DAGs to Composer
         run: |
           gsutil -m rsync -r -d \
             artifacts/dags/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/dags/
+            gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
 
   deploy-dbt:
     runs-on: ubuntu-latest
@@ -297,11 +312,14 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      # data/ is the only prefix besides dags/ that Composer mounts into workers
+      # (as /home/airflow/gcs/data). A top-level dbt/ prefix is invisible to
+      # Airflow, so dbt tasks would never find the project.
       - name: Sync dbt project
         run: |
           gsutil -m rsync -r -d \
             artifacts/dbt/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/dbt/
+            gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
 
   deploy-configs-jobs:
     runs-on: ubuntu-latest
@@ -320,14 +338,29 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      # No -d. TRD-002 :576 makes configs a non-destructive sync deliberately, so
+      # deploying one domain cannot delete another domain's configs. Removing a
+      # config is therefore an explicit `gsutil rm`, not a side effect.
+      #
+      # Each directory is guarded: the filter fires when EITHER configs or jobs
+      # changed, but both steps run, and `rsync` hard-fails on a missing source.
+      # That is what broke run 17.
       - name: Sync config files
         run: |
-          gsutil -m rsync -r -d \
-            artifacts/configs/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/configs/
+          if [ -d artifacts/configs ]; then
+            gsutil -m rsync -r \
+              artifacts/configs/ \
+              gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
+          else
+            echo "artifacts/configs does not exist - nothing to sync"
+          fi
 
       - name: Sync job files
         run: |
-          gsutil -m rsync -r -d \
-            artifacts/jobs/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/jobs/
+          if [ -d artifacts/jobs ]; then
+            gsutil -m rsync -r \
+              artifacts/jobs/ \
+              gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
+          else
+            echo "artifacts/jobs does not exist - nothing to sync"
+          fi
