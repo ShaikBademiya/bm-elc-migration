@@ -1,0 +1,273 @@
+name: Release
+
+# TRD-002 (:123, :511, :603-625): release.yml is dispatched with a bump type,
+# computes the next semantic version, tags it, publishes the versioned artifacts
+# and syncs prod, behind a GitHub `prod` environment approval gate.
+#
+# This is the promotion path. deploy.yml is continuous delivery to whichever
+# environment a branch maps to; release.yml produces a tagged, immutable version
+# and is the only workflow that should ever write to prod deliberately.
+#
+# NOTE: the `prod` environment currently has no protection rules configured, so
+# the approval gate is a no-op until a required reviewer is added in
+# Settings > Environments > prod. Every prod-touching job below already carries
+# `environment: prod`, so adding the reviewer is the only step needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: 'Compute the version and build, but publish nothing'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Must match deploy.yml, or a release would write to different prefixes than
+  # continuous delivery does.
+  DOMAIN: udp
+
+jobs:
+  tag:
+    name: Compute version and tag
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+      has_databricks_bundle: ${{ steps.detect.outputs.has_databricks_bundle }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Detected here rather than with hashFiles() in the Databricks job's if:.
+      # hashFiles resolves against the workspace, which is not checked out when a
+      # job-level condition is evaluated, so it would always be empty and the job
+      # would never run - failing silently instead of staying dormant.
+      - name: Detect Databricks bundle
+        id: detect
+        run: |
+          if [ -f databricks.yml ]; then
+            echo "has_databricks_bundle=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_databricks_bundle=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "databricks.yml present: $([ -f databricks.yml ] && echo yes || echo no)"
+
+      - name: Compute next version
+        id: bump
+        run: |
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          [ -z "$LATEST" ] && LATEST="v0.0.0"
+
+          MAJOR=$(echo "${LATEST#v}" | cut -d. -f1)
+          MINOR=$(echo "${LATEST#v}" | cut -d. -f2)
+          PATCH=$(echo "${LATEST#v}" | cut -d. -f3)
+
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Previous: ${LATEST}  ->  next: v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}"    >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+  publish:
+    name: Publish versioned artifacts
+    runs-on: ubuntu-latest
+    needs: tag
+
+    # Blocks until a reviewer approves, once protection rules are configured.
+    environment:
+      name: prod
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Stamp release version
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.tag.outputs.version }}\"/" pyproject.toml
+          grep '^version' pyproject.toml
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheel
+          path: dist/*.whl
+
+      - uses: google-github-actions/auth@v2
+        if: ${{ !inputs.dry_run }}
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        if: ${{ !inputs.dry_run }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Publish wheel to Artifact Registry
+        if: ${{ !inputs.dry_run }}
+        env:
+          TWINE_USERNAME: oauth2accesstoken
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
+        run: |
+          pip install twine keyring keyrings.google-artifactregistry-auth
+          export TWINE_PASSWORD="$(gcloud auth print-access-token)"
+          python -m twine upload --verbose \
+            --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
+            dist/*.whl
+
+      - name: Build and push release image
+        if: ${{ !inputs.dry_run }}
+        env:
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
+
+          # Tagged with the release version and with the commit sha, so an image
+          # can always be traced back to the code that produced it.
+          docker build -t "${BASE}:${VERSION}" -t "${BASE}:${GITHUB_SHA}" .
+          docker push "${BASE}:${VERSION}"
+          docker push "${BASE}:${GITHUB_SHA}"
+
+  deploy-databricks:
+    name: Deploy Databricks bundle
+    runs-on: ubuntu-latest
+    needs: [tag, publish]
+
+    environment:
+      name: prod
+
+    # TRD-002 (:510, :580-588) includes a DABs deploy in the release path.
+    # There is no databricks.yml in this repo yet, so this job stays dormant and
+    # activates automatically the moment the bundle is added.
+    if: ${{ !inputs.dry_run && needs.tag.outputs.has_databricks_bundle == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy bundle to prod
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks bundle deploy -t prod
+
+  deploy-composer:
+    name: Sync artifacts to prod Composer bucket
+    runs-on: ubuntu-latest
+    needs: [tag, publish]
+    if: ${{ !inputs.dry_run }}
+
+    environment:
+      name: prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Destinations mirror deploy.yml exactly: everything under a prefix
+      # Composer actually mounts (dags/ or data/), namespaced by domain so a
+      # destructive sync cannot reach another domain on a shared bucket.
+      - name: Sync DAGs
+        run: |
+          gsutil -m rsync -r -d \
+            artifacts/dags/ gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+
+      - name: Sync dbt project
+        run: |
+          gsutil -m rsync -r -d \
+            artifacts/dbt/ gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+
+      # Non-destructive by design: TRD-002 (:576) keeps configs without -d so a
+      # release does not delete another domain's configs from a shared bucket.
+      - name: Sync configs and jobs
+        run: |
+          if [ -d artifacts/configs ]; then
+            gsutil -m rsync -r \
+              artifacts/configs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
+          fi
+          if [ -d artifacts/jobs ]; then
+            gsutil -m rsync -r \
+              artifacts/jobs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
+          fi
+
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: [tag, publish, deploy-composer]
+    if: ${{ !inputs.dry_run }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-wheel
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.tag.outputs.tag }}" \
+            dist/*.whl \
+            --title "${{ needs.tag.outputs.tag }}" \
+            --generate-notes

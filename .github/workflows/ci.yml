@@ -1,0 +1,138 @@
+name: CI
+
+# TRD-002 (:508): ci.yml - PR + push, lint (ruff) and test (pytest).
+# Extended with a package job, because the artifact this repo publishes is a
+# wheel and a Docker image: a green lint and test run says nothing about
+# whether the thing we actually ship is usable.
+
+on:
+  pull_request:
+    paths:
+      - 'amf/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - '.github/scripts/**'
+      - '.github/workflows/ci.yml'
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'amf/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - '.github/scripts/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+# Least privilege. Nothing here writes to the repo or to a cloud provider.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  # Pinned deliberately. An unpinned linter turns every upstream release into a
+  # surprise red build on an unrelated PR: ruff 0.16.0 enabled new default rules
+  # and broke this workflow the first time it ran. Bump this on purpose.
+  RUFF_VERSION: '0.16.0'
+  PYTEST_VERSION: '9.1.1'
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install "ruff==${{ env.RUFF_VERSION }}"
+
+      - name: ruff check
+        run: ruff check .
+
+      # Scoped to code this repo owns. artifacts/ holds deployable fixtures that
+      # are intentionally left as-authored, so they are linted but not formatted.
+      - name: ruff format --check
+        run: ruff format --check amf/ tests/ .github/scripts/
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: pip install "pytest==${{ env.PYTEST_VERSION }}" pyyaml
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  package:
+    name: Package (wheel is installable and runnable)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Assert every declared console script is packaged
+        run: |
+          python - <<'PY'
+          import glob, tomllib, zipfile, sys
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+
+          with open("pyproject.toml", "rb") as fh:
+              scripts = tomllib.load(fh)["project"].get("scripts", {})
+
+          missing = []
+          for name, target in scripts.items():
+              module = target.partition(":")[0].replace(".", "/") + ".py"
+              if module not in names:
+                  missing.append(f"{name} -> {target} (expected {module} in the wheel)")
+
+          if missing:
+              print("Console scripts point at modules that are not packaged:")
+              for item in missing:
+                  print("  -", item)
+              sys.exit(1)
+
+          print(f"{wheel}: all {len(scripts)} console script target(s) packaged")
+          PY
+
+      - name: Install the wheel into a clean environment and run it
+        run: |
+          uv venv .verify
+          uv pip install --python .verify/bin/python dist/*.whl
+          .verify/bin/amf-pipeline --version
+          .verify/bin/amf-pipeline --wave smoke --job smoke
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-wheel
+          path: dist/*.whl
+          retention-days: 7
