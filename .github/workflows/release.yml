@@ -157,11 +157,27 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           pip install twine keyring keyrings.google-artifactregistry-auth
+          set -euo pipefail
+
+          # Artifact Registry rejects re-uploading an existing version, and its
+          # API does not implement twine's --skip-existing (twine 7 raises
+          # UnsupportedConfiguration against an AR repository). Ask the registry
+          # directly instead - this is idempotent without swallowing real errors.
+          if gcloud artifacts versions describe "${VERSION}" \
+               --package=amf \
+               --repository="${REPOSITORY}" \
+               --location="${REGION}" \
+               --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "amf ${VERSION} is already published; nothing to upload."
+            exit 0
+          fi
+
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
-          # Re-running a workflow rebuilds the same version; without --skip-existing the upload hard-fails with a 400 and the deploy goes red.
-          python -m twine upload --verbose --skip-existing \
+
+          python -m twine upload --verbose \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
 
