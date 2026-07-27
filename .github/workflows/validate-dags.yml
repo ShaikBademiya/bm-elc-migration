@@ -1,0 +1,84 @@
+name: Validate DAGs
+
+# TRD-002 (:121, :627-650): validate-dags.yml runs on PRs touching DAG, config
+# or dbt paths, in three stages - schema validation, DAG entry generation check,
+# and a coverage report.
+#
+# TRD-002 expects `amf.cli validate` to be the engine. That CLI does not exist in
+# this repo yet, so .github/scripts/validate_artifacts.py stands in with the same
+# gates and the same pass/fail contract. When the framework lands, swap the one
+# command below and the workflow is unchanged.
+
+on:
+  pull_request:
+    paths:
+      - 'artifacts/**'
+      - '.github/scripts/validate_artifacts.py'
+      - '.github/workflows/validate-dags.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-dags-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      # Stages 1-3 run in one process so the job summary is a single report.
+      # Errors fail the build; warnings (a config without a DAG during
+      # development, an orphaned DAG) are reported and do not.
+      - name: Schema validation, DAG structure check, coverage report
+        run: python .github/scripts/validate_artifacts.py
+
+  deployability:
+    name: Deployability checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # deploy.yml syncs with `gsutil rsync -d`, which deletes anything in the
+      # destination prefix that is not in the source. An accidentally emptied
+      # artifact directory would therefore wipe the corresponding Composer
+      # prefix, and the sync would still report success.
+      - name: Refuse to deploy an empty artifact directory
+        run: |
+          status=0
+          for dir in artifacts/dags artifacts/dbt artifacts/configs artifacts/jobs; do
+            if [ ! -d "$dir" ]; then
+              echo "::error::$dir is missing - deploy-configs-jobs and friends will fail on rsync"
+              status=1
+            elif [ -z "$(find "$dir" -type f -print -quit)" ]; then
+              echo "::error::$dir is empty - a destructive rsync would clear its Composer prefix"
+              status=1
+            else
+              echo "$dir: $(find "$dir" -type f | wc -l) file(s)"
+            fi
+          done
+          exit $status
+
+      # Composer mounts only gs://<bucket>/dags and gs://<bucket>/data into
+      # workers, and a destructive rsync is only safe inside a prefix this
+      # domain owns. Both failures are invisible at runtime because gsutil
+      # reports success either way, so they have to be caught statically.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check GCS sync targets
+        run: python .github/scripts/check_sync_targets.py
