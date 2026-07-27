@@ -96,7 +96,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -163,10 +163,31 @@ jobs:
             echo "| rebuild wheel/image | \`${PY}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Quality gates. Until now deploy.yml had no `needs:` on any check, so a
+  # commit could deploy to the prod bucket with zero checks having run - provable
+  # from the check-runs API on b55e898, d008ca4 and a7f6a63, where the only
+  # check-runs are deploy.yml's own jobs.
+  #
+  # Same control the estate uses: etp-etl-core/dev.yml:42 gates its deploy on
+  # `needs: [python-lint, sql-lint, json-lint]`.
+  quality:
+    name: Quality gate
+    needs: setup
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  artifacts-valid:
+    name: Artifact validation gate
+    needs: setup
+    uses: ./.github/workflows/validate-dags.yml
+    permissions:
+      contents: read
+
   build-wheel:
     name: Build wheel
     runs-on: ubuntu-latest
-    needs: [setup, changes]
+    needs: [setup, changes, quality]
     if: needs.changes.outputs.python == 'true'
     timeout-minutes: 15
 
@@ -174,12 +195,12 @@ jobs:
       version: ${{ steps.version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
       - name: Set package version
         id: version
@@ -195,7 +216,7 @@ jobs:
         run: uv build --wheel
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pipeline-wheel
           path: dist/*.whl
@@ -210,18 +231,18 @@ jobs:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pipeline-wheel
           path: dist
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -253,12 +274,12 @@ jobs:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Download wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pipeline-wheel
           path: dist
@@ -268,11 +289,11 @@ jobs:
           echo "Wheel used for Docker image:"
           ls -lh dist/
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       - name: Configure Docker authentication
         run: |
@@ -319,24 +340,22 @@ jobs:
   deploy-dags:
     name: Sync DAGs
     runs-on: ubuntu-latest
-    needs: [setup]
+    needs: [setup, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      # Namespaced under dags/<domain>/ so the destructive -d below can only
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
       # ever delete this domain's DAGs. Against a shared Composer bucket an
       # un-namespaced `rsync -d` at dags/ would delete every other domain's tree.
       - name: Guard against a mass deletion
@@ -362,22 +381,22 @@ jobs:
   deploy-dbt:
     name: Sync dbt project
     runs-on: ubuntu-latest
-    needs: [setup]
+    needs: [setup, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       - name: Guard against a mass deletion
         env:
@@ -404,24 +423,22 @@ jobs:
   deploy-configs-jobs:
     name: Sync configs and jobs
     runs-on: ubuntu-latest
-    needs: [setup]
+    needs: [setup, quality, artifacts-valid]
     timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      # No -d. TRD-002 :576 makes configs a non-destructive sync deliberately,
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
       # so deploying one domain cannot delete another domain's configs. Removing
       # a config is therefore an explicit `gsutil rm`, not a side effect. No
       # deletion guard is needed here for the same reason.
