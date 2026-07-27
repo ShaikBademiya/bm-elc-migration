@@ -39,6 +39,11 @@ concurrency:
 
 env:
   PYTHON_VERSION: '3.12'
+  # Pinned deliberately. An unpinned linter turns every upstream release into a
+  # surprise red build on an unrelated PR: ruff 0.16.0 enabled new default rules
+  # and broke this workflow the first time it ran. Bump this on purpose.
+  RUFF_VERSION: '0.16.0'
+  PYTEST_VERSION: '9.1.1'
 
 jobs:
   lint:
@@ -53,7 +58,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install "ruff==${{ env.RUFF_VERSION }}"
 
       - name: ruff check
         run: ruff check .
@@ -75,7 +80,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install test dependencies
-        run: pip install pytest pyyaml
+        run: pip install "pytest==${{ env.PYTEST_VERSION }}" pyyaml
 
       - name: Run tests
         run: python -m pytest tests/ -q

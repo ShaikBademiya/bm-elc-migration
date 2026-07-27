@@ -9,17 +9,29 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
-import tomllib
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# pyproject declares requires-python >=3.10, but tomllib is only stdlib from
+# 3.11. Import it lazily and skip rather than pretend the package needs 3.11.
+needs_tomllib = pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="tomllib is only available from Python 3.11",
+)
+
 
 def load_pyproject() -> dict:
+    import tomllib
+
     with (ROOT / "pyproject.toml").open("rb") as fh:
         return tomllib.load(fh)
 
 
+@needs_tomllib
 def test_declared_console_scripts_resolve() -> None:
     """Every ``[project.scripts]`` target must import and be callable."""
     scripts = load_pyproject()["project"].get("scripts", {})
@@ -51,6 +63,7 @@ def test_entry_point_returns_zero_without_arguments() -> None:
     assert main([]) == 0
 
 
+@needs_tomllib
 def test_packaged_paths_declared_in_pyproject_exist() -> None:
     """`packages.find.include` must not name packages that no longer exist."""
     config = load_pyproject()
