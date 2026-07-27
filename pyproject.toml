@@ -1,10 +1,11 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "amf"
-version = "0.0.0"
+# Derived from git tags by setuptools-scm; see [tool.setuptools_scm].
+dynamic = ["version"]
 description = "Automated Migration Framework — agent-driven data pipeline automation"
 requires-python = ">=3.10"
 dependencies = [
@@ -53,6 +54,23 @@ amf-pipeline = "amf.core.entry:main"
 [tool.ruff]
 line-length = 100
 exclude = ["reference/", "source_repo/", "tests/pbi_smoke/"]
+
+# TRD-002 mandates setuptools-scm (:261, :276-279, :562, :615). It replaces
+# 0.0.${GITHUB_RUN_NUMBER}, which was shared across branches, reset if the
+# workflow was renamed, could move backwards, and carried no reference to the
+# commit that produced the artifact.
+#
+# Tagged commit      -> 1.2.3
+# Untagged commit    -> 1.2.4.dev5+g<sha>
+#
+# The +g<sha> local segment is what makes an artifact traceable to a commit.
+# Verified 2026-07-28 that Artifact Registry accepts and stores it: a probe
+# wheel uploaded as 0.1.0.dev3+g1a2b3c4 and listed back unchanged.
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+# Used when git metadata is absent, e.g. a source tarball or a shallow clone.
+fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 include = ["amf.core*"]

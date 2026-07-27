@@ -18,6 +18,12 @@ on:
       - 'uv.lock'
       - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      full_deploy:
+        description: 'Reconcile every artifact instead of deploying only changed files'
+        required: false
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -26,10 +32,10 @@ env:
   # shared Composer bucket. Matches the dags/udp/ convention in TRD-002 :569 and
   # the dags/${domain_name}/ convention already used by etp-etl-core.
   DOMAIN: udp
+  # Upper bound on deletions in a single run, enforced by deploy_artifacts.sh.
+  # A larger removal is treated as a bad diff rather than an intent to delete.
+  MAX_DELETIONS: 25
 
-# Two pushes in quick succession would otherwise run overlapping rsyncs against
-# the same GCS prefixes. Queue rather than cancel: a half-finished deploy that
-# gets cancelled mid-sync leaves the bucket in an unknown state.
 # Least privilege. id-token is requested so the auth step can move to Workload
 # Identity Federation without restructuring this workflow; nothing here needs
 # write access to repository contents.
@@ -37,13 +43,20 @@ permissions:
   contents: read
   id-token: write
 
+# Keyed on the branch, and shared with release.yml, because both write to the
+# same Composer prefixes. Queue rather than cancel: a deploy cancelled midway
+# through a deploy leaves the bucket in an unknown state. `queue: max` cannot be
+# combined with cancel-in-progress: true.
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: composer-deploy-${{ github.ref_name }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   setup:
+    name: Resolve environment
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     outputs:
       environment: ${{ steps.set-env.outputs.environment }}
@@ -72,120 +85,215 @@ jobs:
           esac
 
           echo "Resolved deployment environment: ${ENVIRONMENT}"
-
           echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "### Deploying to \`${ENVIRONMENT}\` from \`${GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
 
-
+  # No `environment:` here deliberately. This job touches nothing and holds no
+  # credentials, and once a required reviewer exists on an environment, every
+  # job bound to it raises its own approval prompt.
   changes:
+    name: Detect changed paths
     runs-on: ubuntu-latest
     needs: setup
-
-    environment:
-      name: ${{ needs.setup.outputs.environment }}
+    timeout-minutes: 10
 
     outputs:
       python: ${{ steps.filter.outputs.python }}
-      dags: ${{ steps.filter.outputs.dags }}
-      dbt: ${{ steps.filter.outputs.dbt }}
-      configs_jobs: ${{ steps.filter.outputs.configs_jobs }}
+      # "full" means the diff could not be trusted, so the deploy jobs must
+      # reconcile the whole directory instead of applying a change set that may
+      # be empty or wrong.
+      full: ${{ steps.filter.outputs.full }}
+      manifest: ${{ steps.filter.outputs.manifest }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            # Code only. artifacts/configs and artifacts/jobs are data and are
-            # covered by the configs_jobs filter below. Including them here
-            # rebuilt and republished a byte-identical wheel and image on every
-            # config-only change - the config/code coupling ADR-006 Decision 2
-            # exists to remove.
-            python:
-              - 'amf/core/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - 'databricks.yml'
+      # Deliberately NOT dorny/paths-filter. That action defaults `base` to the
+      # repository default branch, so on any other branch it diffs from
+      # merge-base(default, current) rather than from the previous commit. On
+      # `main` that produced false positives on every run, and after an ordinary
+      # merge commit it produces the opposite - zero detected changes, every
+      # deploy job skipped, and a green run that deployed nothing.
+      #
+      # This is the estate's approach (etp-etl-core/dev.yml:63-91): diff against
+      # github.event.before, with an explicit fallback. It has no fork-point
+      # concept and cannot exhibit either failure.
+      - name: Detect changed paths
+        id: filter
+        env:
+          BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          FORCE_FULL: ${{ inputs.full_deploy }}
+        run: |
+          set -euo pipefail
 
-            dags:
-              - 'artifacts/dags/**'
+          FULL=false
+          BASE_SHA="${HEAD_SHA}"
 
-            dbt:
-              - 'artifacts/dbt/**'
+          if [ "${FORCE_FULL:-false}" = "true" ]; then
+            FULL=true
+            echo "full_deploy requested - reconciling every artifact"
+          elif [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            FULL=true
+            echo "No previous commit (new branch or manual run) - reconciling"
+          elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            FULL=true
+            echo "Previous commit ${BEFORE} is unreachable (force-push) - reconciling"
+          else
+            BASE_SHA="${BEFORE}"
+            echo "Comparing ${BASE_SHA}..${HEAD_SHA}"
+          fi
 
-            configs_jobs:
-              - 'artifacts/configs/**'
-              - 'artifacts/jobs/**'
+          # -M so a rename is reported as R<score> old new, letting the deploy
+          # remove the old object instead of orphaning it.
+          MANIFEST=""
+          if [ "${FULL}" = "false" ]; then
+            MANIFEST="$(git diff --name-status -M "${BASE_SHA}" "${HEAD_SHA}")"
+          fi
+
+          if [ "${FULL}" = "true" ]; then
+            PY=true
+          elif echo "${MANIFEST}" | grep -qE '^[A-Z][0-9]*[[:space:]]+(amf/core/|pyproject\.toml|uv\.lock|databricks\.yml)'; then
+            PY=true
+          else
+            PY=false
+          fi
+
+          CHANGE_COUNT="$(echo "${MANIFEST}" | grep -c . || true)"
+
+          echo "--- manifest ---"
+          echo "${MANIFEST}"
+          echo "----------------"
+
+          {
+            echo "base_sha=${BASE_SHA}"
+            echo "full=${FULL}"
+            echo "python=${PY}"
+            echo "manifest<<MANIFEST_EOF"
+            echo "${MANIFEST}"
+            echo "MANIFEST_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Surfaced in the summary, not buried in a collapsed log group - the
+          # original defect went unnoticed for 34 runs because the diff base was
+          # only visible inside ##[group].
+          if [ "${FULL}" = "true" ]; then MODE=full-reconciliation; else MODE=incremental; fi
+          {
+            echo "| Detection | Value |"
+            echo "| --- | --- |"
+            echo "| base sha | \`${BASE_SHA}\` |"
+            echo "| head sha | \`${HEAD_SHA}\` |"
+            echo "| mode | \`${MODE}\` |"
+            echo "| changed files | \`${CHANGE_COUNT}\` |"
+            echo "| rebuild wheel/image | \`${PY}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Quality gates. Until now deploy.yml had no `needs:` on any check, so a
+  # commit could deploy to the prod bucket with zero checks having run - provable
+  # from the check-runs API on b55e898, d008ca4 and a7f6a63, where the only
+  # check-runs are deploy.yml's own jobs.
+  #
+  # Same control the estate uses: etp-etl-core/dev.yml:42 gates its deploy on
+  # `needs: [python-lint, sql-lint, json-lint]`.
+  quality:
+    name: Quality gate
+    needs: setup
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  artifacts-valid:
+    name: Artifact validation gate
+    needs: setup
+    uses: ./.github/workflows/validate-dags.yml
+    permissions:
+      contents: read
 
   build-wheel:
+    name: Build wheel
     runs-on: ubuntu-latest
-    needs: [setup, changes]
+    needs: [setup, changes, quality]
     if: needs.changes.outputs.python == 'true'
-
-    environment:
-      name: ${{ needs.setup.outputs.environment }}
+    timeout-minutes: 15
 
     outputs:
       version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      # fetch-depth: 0 is required, not merely convenient: setuptools-scm derives
+      # the version from the nearest tag, and a shallow clone has none.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v6
-
-      - name: Set package version
-        id: version
-        run: |
-            VERSION="0.0.${GITHUB_RUN_NUMBER}"
-
-            echo "Package version: ${VERSION}"
-
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-            sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
-
-            echo "Updated pyproject.toml:"
-            grep '^version' pyproject.toml
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
       - name: Build wheel
         run: uv build --wheel
 
-      # Optional: Inspect the generated wheel files for debugging purposes
-      # - name: Inspect generated wheel
-      #   run: |
-      #       echo "Generated wheel files:"
-      #       ls -lh dist/
+      # Read the version off the artifact rather than computing it separately -
+      # the filename is the authoritative answer to "what did we just build".
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl | head -1)"
+          VERSION="$(basename "${WHEEL}" | cut -d- -f2)"
+
+          # PEP 440 local segments use '+', which is not a legal character in a
+          # Docker tag ([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}). Substituting it keeps
+          # the sha visible in the tag instead of dropping the local segment.
+          IMAGE_TAG="${VERSION//+/_}"
+
+          echo "wheel     : ${WHEEL}"
+          echo "version   : ${VERSION}"
+          echo "image tag : ${IMAGE_TAG}"
+
+          {
+            echo "version=${VERSION}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "| Artifact | Value |"
+            echo "| --- | --- |"
+            echo "| wheel version | \`${VERSION}\` |"
+            echo "| image tag | \`${IMAGE_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pipeline-wheel
           path: dist/*.whl
 
   deploy-artifact-registry-python:
+    name: Publish wheel to Artifact Registry
     runs-on: ubuntu-latest
     needs: [setup, build-wheel]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pipeline-wheel
           path: dist
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -200,7 +308,24 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
+          VERSION: ${{ needs.build-wheel.outputs.version }}
         run: |
+
+          set -euo pipefail
+
+          # Artifact Registry rejects re-uploading an existing version, and its
+          # API does not implement twine's --skip-existing (twine 7 raises
+          # UnsupportedConfiguration against an AR repository). Ask the registry
+          # directly instead - this is idempotent without swallowing real errors.
+          if gcloud artifacts versions describe "${VERSION}" \
+               --package=amf \
+               --repository="${REPOSITORY}" \
+               --location="${REGION}" \
+               --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "amf ${VERSION} is already published; nothing to upload."
+            exit 0
+          fi
+
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
 
           python -m twine upload --verbose \
@@ -208,20 +333,21 @@ jobs:
             dist/*.whl
 
   deploy-artifact-registry-docker:
+    name: Publish image to Artifact Registry
     runs-on: ubuntu-latest
-
     needs: [setup, build-wheel]
-
+    timeout-minutes: 30
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pipeline-wheel
           path: dist
@@ -231,27 +357,23 @@ jobs:
           echo "Wheel used for Docker image:"
           ls -lh dist/
 
-
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       - name: Configure Docker authentication
         run: |
           gcloud auth configure-docker \
-            ${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev
-
+            "${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev" --quiet
 
       - name: Build Docker image
         env:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.version }}
-
+          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
 
@@ -270,108 +392,142 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
-          VERSION: ${{ needs.build-wheel.outputs.version }}
-
+          VERSION: ${{ needs.build-wheel.outputs.image_tag }}
         run: |
           BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
-
           echo "Pushing ${BASE}:${VERSION} and ${BASE}:${GITHUB_SHA}"
-
           docker push "${BASE}:${VERSION}"
           docker push "${BASE}:${GITHUB_SHA}"
 
+  # The deploy jobs below apply the manifest from `changes` file by file, rather
+  # than replacing the whole destination prefix. Only what changed is copied, and
+  # only what was deleted is removed.
+  #
+  # They consume the diff, so a wrong diff matters. That is handled at the source:
+  # `changes` emits full=true whenever the diff cannot be trusted (new branch,
+  # manual run, force-push), and full mode reconciles the directory instead. An
+  # unreliable diff therefore over-deploys rather than silently deploying nothing.
   deploy-dags:
+    name: Deploy DAGs
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.dags == 'true'
+    needs: [setup, changes, quality, artifacts-valid]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      # Namespaced under dags/<domain>/ so the destructive -d below can only ever
-      # delete this domain's DAGs. Against a shared Composer bucket an
-      # un-namespaced `rsync -d` at dags/ would delete every other domain's tree.
-      - name: Sync DAGs to Composer
+      # Namespaced under dags/<domain>/ so this domain can only ever touch
+      # its own DAGs on a shared Composer bucket.
+      - name: Deploy DAGs
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
         run: |
-          gsutil -m rsync -r -d \
-            artifacts/dags/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" "$MODE"
 
   deploy-dbt:
+    name: Deploy dbt project
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.dbt == 'true'
+    needs: [setup, changes, quality, artifacts-valid]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      # data/ is the only prefix besides dags/ that Composer mounts into workers
-      # (as /home/airflow/gcs/data). A top-level dbt/ prefix is invisible to
-      # Airflow, so dbt tasks would never find the project.
-      - name: Sync dbt project
+      # data/ is the only prefix besides dags/ that Composer mounts into
+      # workers (as /home/airflow/gcs/data). A top-level dbt/ prefix is
+      # invisible to Airflow.
+      - name: Deploy dbt project
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
         run: |
-          gsutil -m rsync -r -d \
-            artifacts/dbt/ \
-            gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" "$MODE"
 
-  deploy-configs-jobs:
+  deploy-configs:
+    name: Deploy configs
     runs-on: ubuntu-latest
-    needs: [setup, changes]
-    if: needs.changes.outputs.configs_jobs == 'true'
+    needs: [setup, changes, quality, artifacts-valid]
+    timeout-minutes: 15
 
     environment:
       name: ${{ needs.setup.outputs.environment }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      # No -d. TRD-002 :576 makes configs a non-destructive sync deliberately, so
-      # deploying one domain cannot delete another domain's configs. Removing a
-      # config is therefore an explicit `gsutil rm`, not a side effect.
-      #
-      # Each directory is guarded: the filter fires when EITHER configs or jobs
-      # changed, but both steps run, and `rsync` hard-fails on a missing source.
-      # That is what broke run 17.
-      - name: Sync config files
+      - name: Deploy configs
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
         run: |
-          if [ -d artifacts/configs ]; then
-            gsutil -m rsync -r \
-              artifacts/configs/ \
-              gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
-          else
-            echo "artifacts/configs does not exist - nothing to sync"
-          fi
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" "$MODE"
 
-      - name: Sync job files
+  deploy-jobs:
+    name: Deploy job definitions
+    runs-on: ubuntu-latest
+    needs: [setup, changes, quality, artifacts-valid]
+    timeout-minutes: 15
+
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Deploy job definitions
+        env:
+          # Passed as data, never interpolated into the command. A filename is
+          # attacker-controllable, and `for f in ${{ ... }}` would make it code.
+          MANIFEST: ${{ needs.changes.outputs.manifest }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
         run: |
-          if [ -d artifacts/jobs ]; then
-            gsutil -m rsync -r \
-              artifacts/jobs/ \
-              gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
-          else
-            echo "artifacts/jobs does not exist - nothing to sync"
-          fi
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" "$MODE"

@@ -33,9 +33,13 @@ on:
 permissions:
   contents: read
 
+# Shares deploy.yml's group: both write to the same Composer prefixes, so a
+# release and a branch deploy must never interleave. ref_name keys it to the
+# branch the release is cut from.
 concurrency:
-  group: release
+  group: composer-deploy-${{ github.ref_name }}
   cancel-in-progress: false
+  queue: max
 
 env:
   # Must match deploy.yml, or a release would write to different prefixes than
@@ -46,6 +50,7 @@ jobs:
   tag:
     name: Compute version and tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     permissions:
       contents: write
@@ -56,7 +61,7 @@ jobs:
       has_databricks_bundle: ${{ steps.detect.outputs.has_databricks_bundle }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -107,6 +112,7 @@ jobs:
   publish:
     name: Publish versioned artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: tag
 
     # Blocks until a reviewer approves, once protection rules are configured.
@@ -114,34 +120,33 @@ jobs:
       name: prod
 
     steps:
-      - uses: actions/checkout@v4
+      # Check out the tag itself. setuptools-scm reads the version from the
+      # nearest tag, so building the tagged commit is what produces a clean
+      # X.Y.Z rather than a .devN+g<sha>.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ needs.tag.outputs.tag }}
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v6
-
-      - name: Stamp release version
-        run: |
-          sed -i "s/^version = \".*\"/version = \"${{ needs.tag.outputs.version }}\"/" pyproject.toml
-          grep '^version' pyproject.toml
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
       - name: Build wheel
         run: uv build --wheel
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-wheel
           path: dist/*.whl
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         if: ${{ !inputs.dry_run }}
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
         if: ${{ !inputs.dry_run }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
@@ -152,9 +157,26 @@ jobs:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
           REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_PYTHON_REPOSITORY }}
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           pip install twine keyring keyrings.google-artifactregistry-auth
+          set -euo pipefail
+
+          # Artifact Registry rejects re-uploading an existing version, and its
+          # API does not implement twine's --skip-existing (twine 7 raises
+          # UnsupportedConfiguration against an AR repository). Ask the registry
+          # directly instead - this is idempotent without swallowing real errors.
+          if gcloud artifacts versions describe "${VERSION}" \
+               --package=amf \
+               --repository="${REPOSITORY}" \
+               --location="${REGION}" \
+               --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "amf ${VERSION} is already published; nothing to upload."
+            exit 0
+          fi
+
           export TWINE_PASSWORD="$(gcloud auth print-access-token)"
+
           python -m twine upload --verbose \
             --repository-url "https://${REGION}-python.pkg.dev/${PROJECT_ID}/${REPOSITORY}/" \
             dist/*.whl
@@ -179,6 +201,7 @@ jobs:
   deploy-databricks:
     name: Deploy Databricks bundle
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [tag, publish]
 
     environment:
@@ -190,9 +213,9 @@ jobs:
     if: ${{ !inputs.dry_run && needs.tag.outputs.has_databricks_bundle == 'true' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: databricks/setup-cli@main
+      - uses: databricks/setup-cli@8b7b124dc4f5b9621e959ea61cf4d3dd4e421f67 # v1.9.0
 
       - name: Deploy bundle to prod
         env:
@@ -203,6 +226,7 @@ jobs:
   deploy-composer:
     name: Sync artifacts to prod Composer bucket
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [tag, publish]
     if: ${{ !inputs.dry_run }}
 
@@ -210,43 +234,44 @@ jobs:
       name: prod
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      # Destinations mirror deploy.yml exactly: everything under a prefix
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
       # Composer actually mounts (dags/ or data/), namespaced by domain so a
       # destructive sync cannot reach another domain on a shared bucket.
-      - name: Sync DAGs
-        run: |
-          gsutil -m rsync -r -d \
-            artifacts/dags/ gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}/
+      # A release reconciles every artifact rather than applying a diff: it is
+      # promoting a tagged state, not a change set. Same script as deploy.yml so
+      # there is one deploy mechanism, and `full` mode never passes -d, so a
+      # release cannot delete another domain's files from a shared bucket
+      # (TRD-002 :576).
+      - name: Deploy DAGs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" full
 
-      - name: Sync dbt project
-        run: |
-          gsutil -m rsync -r -d \
-            artifacts/dbt/ gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}/
+      - name: Deploy dbt project
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" full
 
-      # Non-destructive by design: TRD-002 (:576) keeps configs without -d so a
-      # release does not delete another domain's configs from a shared bucket.
-      - name: Sync configs and jobs
-        run: |
-          if [ -d artifacts/configs ]; then
-            gsutil -m rsync -r \
-              artifacts/configs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}/
-          fi
-          if [ -d artifacts/jobs ]; then
-            gsutil -m rsync -r \
-              artifacts/jobs/ gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}/
-          fi
+      - name: Deploy configs
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" full
+
+      - name: Deploy job definitions
+        env:
+          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
+        run: bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" full
 
   github-release:
     name: Create GitHub release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [tag, publish, deploy-composer]
     if: ${{ !inputs.dry_run }}
 
@@ -254,11 +279,11 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-wheel
           path: dist
