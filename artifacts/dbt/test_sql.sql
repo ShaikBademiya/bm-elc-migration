@@ -3,4 +3,4 @@
 select
     "test" as test_column,
     "value" as value_column
-
+-- incremental proof: only this file should deploy
