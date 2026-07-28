@@ -1,15 +1,23 @@
 name: Deploy
 
-# DEV only. Prod is reached exclusively through promote.yml, which deploys an
-# already-published version. Two paths to prod is what made main and master
-# drift apart in the first place, so there is now exactly one.
+# One branch per environment: dev -> DEV, prod -> PROD.
 #
-# `ust` and `sit` were listed here and never existed as branches; their case
-# arms were unreachable. Removed rather than left as dead configuration.
+# This stays build-once because the version comes from the commit, not the
+# branch. Fast-forwarding dev into prod carries the same commit, so it resolves
+# the same version, finds the bundle already published, and deploys those exact
+# bytes without rebuilding. Prod runs what dev ran because it is the same
+# artifact, not a rebuild of the same source.
+#
+# promote.yml remains for deploying an arbitrary published version out of band,
+# such as a rollback to an older one.
+#
+# `ust` and `sit` used to be listed here and never existed as branches; their
+# case arms were unreachable. `master` and `main` are replaced by dev and prod.
 on:
   push:
     branches:
-      - master
+      - dev
+      - prod
     paths:
       - 'amf/core/**'
       - 'artifacts/configs/**'
@@ -71,15 +79,19 @@ jobs:
       - name: Resolve deployment environment
         id: set-env
         run: |
-          # This workflow only ever targets dev. Anything else is a mistake and
-          # should fail loudly rather than deploy somewhere unintended.
+          # Branch name is the environment name. Anything else is a mistake and
+          # fails loudly rather than resolving to an empty environment and
+          # deploying with repository-scoped secrets.
           case "${GITHUB_REF_NAME}" in
-            master)
+            dev)
               ENVIRONMENT="dev"
               ;;
+            prod)
+              ENVIRONMENT="prod"
+              ;;
             *)
-              echo "::error::deploy.yml only deploys dev from master; got '${GITHUB_REF_NAME}'."
-              echo "::error::To reach another environment, run the Promote workflow with a published version."
+              echo "::error::deploy.yml deploys only from 'dev' or 'prod'; got '${GITHUB_REF_NAME}'."
+              echo "::error::To deploy a specific published version, run the Promote workflow."
               exit 1
               ;;
           esac
