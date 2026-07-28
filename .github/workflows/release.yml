@@ -132,9 +132,13 @@ jobs:
       # Check out the tag itself. setuptools-scm reads the version from the
       # nearest tag, so building the tagged commit is what produces a clean
       # X.Y.Z rather than a .devN+g<sha>.
+      # On a real release the tag exists and building it is what yields a clean
+      # X.Y.Z. On a dry run the tag was deliberately not pushed, so checking it
+      # out fails with "a branch or tag with the name 'vX.Y.Z' could not be
+      # found" - fall back to the dispatched ref.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ inputs.dry_run && github.ref || needs.tag.outputs.tag }}
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
