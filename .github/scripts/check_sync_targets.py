@@ -19,9 +19,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# The workflows that write to a Composer bucket. release.yml is deliberately
+# absent: it publishes versioned artifacts and does not deploy, so promote.yml
+# is the only path to an environment.
 WORKFLOWS = [
     ROOT / ".github" / "workflows" / "deploy.yml",
-    ROOT / ".github" / "workflows" / "release.yml",
     ROOT / ".github" / "workflows" / "promote.yml",
 ]
 

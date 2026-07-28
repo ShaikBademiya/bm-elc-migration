@@ -1,12 +1,18 @@
 name: Release
 
 # TRD-002 (:123, :511, :603-625): release.yml is dispatched with a bump type,
-# computes the next semantic version, tags it, publishes the versioned artifacts
-# and syncs prod, behind a GitHub `prod` environment approval gate.
+# computes the next semantic version, tags it, and publishes the versioned
+# artifacts behind a GitHub `prod` environment approval gate.
 #
-# This is the promotion path. deploy.yml is continuous delivery to whichever
-# environment a branch maps to; release.yml produces a tagged, immutable version
-# and is the only workflow that should ever write to prod deliberately.
+# Three workflows, three jobs:
+#   deploy.yml   continuous delivery to whichever environment a branch maps to
+#   release.yml  cuts a tagged, immutable version and PUBLISHES it - this file
+#   promote.yml  deploys an already-published version to an environment
+#
+# release.yml deliberately does NOT deploy. Under build-once-deploy-many there
+# must be exactly one path to prod, and that is promote.yml, which verifies the
+# version exists before touching anything and records what it deployed. A second
+# path here would reintroduce the drift the whole model exists to remove.
 #
 # NOTE: the `prod` environment currently has no protection rules configured, so
 # the approval gate is a no-op until a required reviewer is added in
@@ -45,6 +51,9 @@ env:
   # Must match deploy.yml, or a release would write to different prefixes than
   # continuous delivery does.
   DOMAIN: udp
+  # Must match deploy.yml and promote.yml, or a release publishes the bundle
+  # somewhere promote.yml does not look.
+  BUNDLE_REPO: bm-udp-artifacts
 
 jobs:
   tag:
@@ -198,6 +207,31 @@ jobs:
           docker push "${BASE}:${VERSION}"
           docker push "${BASE}:${GITHUB_SHA}"
 
+      # A release must publish the artifact bundle too, or there is nothing for
+      # promote.yml to deploy at this version. A tag produces a clean X.Y.Z, so
+      # no character substitution is needed here.
+      - name: Publish artifact bundle
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+        run: bash .github/scripts/publish_bundle.sh "${VERSION}"
+
+      - name: Summarise what to promote
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          {
+            echo "### Released \`${VERSION}\`"
+            echo ""
+            echo "Wheel, image and artifact bundle are published."
+            echo ""
+            echo "Nothing has been deployed. Run the **Promote** workflow with"
+            echo "version \`${VERSION}\` and the target environment to deploy it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy-databricks:
     name: Deploy Databricks bundle
     runs-on: ubuntu-latest
@@ -223,56 +257,11 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: databricks bundle deploy -t prod
 
-  deploy-composer:
-    name: Sync artifacts to prod Composer bucket
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: [tag, publish]
-    if: ${{ !inputs.dry_run }}
-
-    environment:
-      name: prod
-
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
-      # Composer actually mounts (dags/ or data/), namespaced by domain so a
-      # destructive sync cannot reach another domain on a shared bucket.
-      # A release reconciles every artifact rather than applying a diff: it is
-      # promoting a tagged state, not a change set. Same script as deploy.yml so
-      # there is one deploy mechanism, and `full` mode never passes -d, so a
-      # release cannot delete another domain's files from a shared bucket
-      # (TRD-002 :576).
-      - name: Deploy DAGs
-        env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
-        run: bash .github/scripts/deploy_artifacts.sh artifacts/dags "$DEST" full
-
-      - name: Deploy dbt project
-        env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
-        run: bash .github/scripts/deploy_artifacts.sh artifacts/dbt "$DEST" full
-
-      - name: Deploy configs
-        env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
-        run: bash .github/scripts/deploy_artifacts.sh artifacts/configs "$DEST" full
-
-      - name: Deploy job definitions
-        env:
-          DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
-        run: bash .github/scripts/deploy_artifacts.sh artifacts/jobs "$DEST" full
-
   github-release:
     name: Create GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [tag, publish, deploy-composer]
+    needs: [tag, publish]
     if: ${{ !inputs.dry_run }}
 
     permissions:
