@@ -14,10 +14,9 @@ name: Release
 # version exists before touching anything and records what it deployed. A second
 # path here would reintroduce the drift the whole model exists to remove.
 #
-# NOTE: the `prod` environment currently has no protection rules configured, so
-# the approval gate is a no-op until a required reviewer is added in
-# Settings > Environments > prod. Every prod-touching job below already carries
-# `environment: prod`, so adding the reviewer is the only step needed.
+# This workflow publishes only. It claims no environment, because it deploys to
+# none - recording a prod deployment for a job that never touches prod made the
+# deployment history lie.
 
 on:
   workflow_dispatch:
@@ -123,10 +122,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: tag
-
-    # Blocks until a reviewer approves, once protection rules are configured.
-    environment:
-      name: prod
 
     steps:
       # Check out the tag itself. setuptools-scm reads the version from the

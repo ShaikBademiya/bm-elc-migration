@@ -1,12 +1,15 @@
 name: Deploy
 
+# DEV only. Prod is reached exclusively through promote.yml, which deploys an
+# already-published version. Two paths to prod is what made main and master
+# drift apart in the first place, so there is now exactly one.
+#
+# `ust` and `sit` were listed here and never existed as branches; their case
+# arms were unreachable. Removed rather than left as dead configuration.
 on:
   push:
     branches:
-      - master # Environment: dev
-      - ust # Environment: ust
-      - sit # Environment: sit
-      - main # Environment: prod
+      - master
     paths:
       - 'amf/core/**'
       - 'artifacts/configs/**'
@@ -68,21 +71,15 @@ jobs:
       - name: Resolve deployment environment
         id: set-env
         run: |
+          # This workflow only ever targets dev. Anything else is a mistake and
+          # should fail loudly rather than deploy somewhere unintended.
           case "${GITHUB_REF_NAME}" in
             master)
               ENVIRONMENT="dev"
               ;;
-            ust)
-              ENVIRONMENT="ust"
-              ;;
-            sit)
-              ENVIRONMENT="sit"
-              ;;
-            main)
-              ENVIRONMENT="prod"
-              ;;
             *)
-              echo "Unsupported branch: ${GITHUB_REF_NAME}"
+              echo "::error::deploy.yml only deploys dev from master; got '${GITHUB_REF_NAME}'."
+              echo "::error::To reach another environment, run the Promote workflow with a published version."
               exit 1
               ;;
           esac
