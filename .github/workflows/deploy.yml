@@ -524,7 +524,7 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/dags/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dags "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dags "$DEST" "$MODE" artifacts/dags
 
   deploy-dbt:
     name: Deploy dbt project
@@ -564,7 +564,7 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/dbt/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dbt "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/dbt "$DEST" "$MODE" artifacts/dbt
 
   deploy-configs:
     name: Deploy configs
@@ -601,7 +601,7 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/configs/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/configs "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/configs "$DEST" "$MODE" artifacts/configs
 
   deploy-jobs:
     name: Deploy job definitions
@@ -638,4 +638,4 @@ jobs:
           MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
         run: |
-          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/jobs "$DEST" "$MODE"
+          echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/jobs "$DEST" "$MODE" artifacts/jobs

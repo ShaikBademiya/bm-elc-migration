@@ -91,12 +91,22 @@ def workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def run(workspace: Path, manifest: str, mode: str = "incremental", **env_extra):
+def run(
+    workspace: Path,
+    manifest: str,
+    mode: str = "incremental",
+    src: str = "artifacts/dags",
+    manifest_prefix: str | None = None,
+    **env_extra,
+):
     env = dict(os.environ)
     env["PATH"] = f"{workspace / 'bin'}{os.pathsep}{env['PATH']}"
     env.update(env_extra)
+    argv = [BASH, str(SCRIPT), src, "gs://bkt/dags/udp", mode]
+    if manifest_prefix is not None:
+        argv.append(manifest_prefix)
     return subprocess.run(
-        [BASH, str(SCRIPT), "artifacts/dags", "gs://bkt/dags/udp", mode],
+        argv,
         input=manifest,
         capture_output=True,
         text=True,
@@ -165,3 +175,33 @@ def test_missing_source_directory_is_a_no_op(workspace: Path) -> None:
     result = run(workspace, "M\tartifacts/dags/existing.py\n")
     assert result.returncode == 0, result.stderr
     assert "nothing to deploy" in result.stdout
+
+
+def test_source_dir_may_differ_from_manifest_prefix(workspace: Path) -> None:
+    """The regression that made every incremental deploy a silent no-op.
+
+    Deploys read from an extracted bundle, so the files live at
+    `_bundle/artifacts/dags` while `git diff` still reports
+    `artifacts/dags/...`. When one value served both purposes nothing matched,
+    zero files were copied, and the job reported success.
+    """
+    bundle = workspace / "_bundle" / "artifacts" / "dags"
+    bundle.mkdir(parents=True)
+    (bundle / "existing.py").write_text("print('from the bundle')\n", encoding="utf-8")
+
+    result = run(
+        workspace,
+        "M\tartifacts/dags/existing.py\n",
+        src="_bundle/artifacts/dags",
+        manifest_prefix="artifacts/dags",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "1 file(s) to copy" in result.stdout
+    assert "CP _bundle/artifacts/dags/existing.py -> gs://bkt/dags/udp/existing.py" in result.stdout
+
+
+def test_manifest_prefix_defaults_to_the_source_dir(workspace: Path) -> None:
+    """Callers where the two agree must keep working without passing a 4th arg."""
+    result = run(workspace, "M\tartifacts/dags/existing.py\n")
+    assert result.returncode == 0, result.stderr
+    assert "CP artifacts/dags/existing.py -> gs://bkt/dags/udp/existing.py" in result.stdout

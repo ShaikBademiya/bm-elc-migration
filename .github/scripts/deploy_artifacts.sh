@@ -17,12 +17,20 @@
 # lines, exactly as `git diff --name-status -M` emits them. It is read as data,
 # never interpolated into the script, so a crafted filename cannot execute.
 #
-# Usage: deploy_artifacts.sh <source-dir> <gcs-destination> <mode>
+# Usage: deploy_artifacts.sh <source-dir> <gcs-destination> <mode> [manifest-prefix]
+#
+# manifest-prefix is the path these files have IN THE MANIFEST, which is not
+# always where they sit on disk. Since deploys read from an extracted bundle the
+# source is `_bundle/artifacts/dags` while the manifest still says
+# `artifacts/dags/...`, because git diff is repo-relative. Conflating the two
+# made every incremental deploy match nothing and report success having copied
+# nothing. Defaults to the source directory for callers where they agree.
 set -euo pipefail
 
 SRC="${1:?source directory required}"
 DEST="${2:?gcs destination required}"
 MODE="${3:-incremental}"
+MANIFEST_PREFIX="${4:-$1}"
 
 # A single run should never delete more than this many files. A larger deletion
 # is treated as a bad diff and stopped, not carried out.
@@ -30,6 +38,7 @@ MAX_DELETIONS="${MAX_DELETIONS:-25}"
 
 SRC="${SRC%/}"
 DEST="${DEST%/}"
+MANIFEST_PREFIX="${MANIFEST_PREFIX%/}"
 
 log() { printf '%s\n' "$*"; }
 
@@ -82,15 +91,17 @@ while IFS=$'\t' read -r status path newpath; do
   newpath="${newpath:-}"
   newpath="${newpath%$'\r'}"
 
-  # Only this artifact class, and only paths genuinely under it.
+  # Only this artifact class, and only paths genuinely under it. Matched
+  # against the manifest prefix, which is repo-relative and may differ from
+  # where the files actually sit on disk.
   case "${path}" in
-    "${SRC}/"*) ;;
+    "${MANIFEST_PREFIX}/"*) ;;
     *) continue ;;
   esac
-  path="${path#"${SRC}/"}"
+  path="${path#"${MANIFEST_PREFIX}/"}"
   if [ -n "${newpath:-}" ]; then
     case "${newpath}" in
-      "${SRC}/"*) newpath="${newpath#"${SRC}/"}" ;;
+      "${MANIFEST_PREFIX}/"*) newpath="${newpath#"${MANIFEST_PREFIX}/"}" ;;
       *) newpath="" ;;
     esac
   fi
