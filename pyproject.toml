@@ -25,7 +25,7 @@ cluster = [
 ]
 agents = [
     "anthropic>=0.52",
-    "pydantic-ai-slim[anthropic]>=1.100",
+    "pydantic-ai-slim[anthropic]>=2.20.0",
     "duckdb>=1.5.3",
 ]
 dbt = [
