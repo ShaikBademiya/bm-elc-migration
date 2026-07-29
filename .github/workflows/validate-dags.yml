@@ -17,10 +17,12 @@ on:
       - '.github/workflows/deploy.yml'
       - '.github/workflows/release.yml'
       - '.github/workflows/validate-dags.yml'
+  # dev and prod are the only live branches; master and main are retained but
+  # dead, so the previous filter fired never.
   push:
     branches:
-      - master
-      - main
+      - dev
+      - prod
     paths: *validate_paths
   # Called by deploy.yml. check_sync_targets.py reads deploy.yml and release.yml,
   # so a change to either must re-run this - previously neither filter matched

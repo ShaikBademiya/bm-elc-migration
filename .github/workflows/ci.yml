@@ -16,10 +16,15 @@ on:
       - 'Dockerfile'
       - '.github/scripts/**'
       - '.github/workflows/**'
+  # dev and prod are the only live branches; master and main are retained but
+  # dead, so the previous filter fired never. deploy.yml also calls this via
+  # workflow_call, which duplicates a run on deployable paths - accepted,
+  # because ci.yml watches paths deploy.yml does not (all of amf/, tests/), and
+  # a direct push touching only those would otherwise get no CI at all.
   push:
     branches:
-      - master
-      - main
+      - dev
+      - prod
     paths: *ci_paths
   # Called by deploy.yml so a deploy cannot proceed on code that has not passed
   # lint, tests and the packaging check. A push trigger alone blocks nothing -

@@ -56,9 +56,34 @@ if [ "${MODE}" = "full" ]; then
     log "refusing to reconcile from an empty source directory"
     exit 1
   fi
-  # -r without -d: additive. Removals in full mode are deliberate operations,
-  # not a side effect of a sync.
-  gsutil -m rsync -r "${SRC}/" "${DEST}/"
+
+  # How many objects would -d remove? Counted before the sync so a bundle that
+  # is wrong-but-not-empty cannot quietly empty a prefix. Same ceiling as the
+  # incremental path, for the same reason.
+  remote_rel="$(gsutil ls -r "${DEST}/**" 2>/dev/null \
+                | grep -vE ':$|/$|^$' \
+                | sed "s|^${DEST}/||" \
+                | sort -u || true)"
+  local_rel="$(cd "${SRC}" && find . -type f | sed 's|^\./||' | sort -u)"
+  doomed=$(comm -23 <(printf '%s\n' "${remote_rel}") <(printf '%s\n' "${local_rel}") | grep -c . || true)
+
+  if [ "${doomed}" -gt "${MAX_DELETIONS}" ]; then
+    log "::error::full reconciliation would delete ${doomed} object(s) from ${DEST}/ (limit ${MAX_DELETIONS}) - refusing"
+    exit 1
+  fi
+  [ "${doomed}" -gt 0 ] && log "reconciliation will remove ${doomed} object(s) no longer in the source"
+
+  # -c is not optional. The artifact bundle is built with a frozen mtime
+  # (--mtime='UTC 2020-01-01') so it is reproducible, and gsutil stores that
+  # mtime on the object. rsync's default comparator is size+mtime, so with the
+  # mtime pinned, ANY edit that leaves the file the same size is invisible and
+  # the sync reports success having copied nothing. Compare checksums instead.
+  #
+  # -d makes this an actual reconciliation: a file removed from the repo is
+  # removed from the bucket. Safe here because DEST is domain-namespaced
+  # (…/dags/udp), the empty-source check above runs first, and deploy manifests
+  # live outside every deploy prefix.
+  gsutil -m rsync -c -d -r "${SRC}/" "${DEST}/"
   log "reconciled ${count} file(s)"
   exit 0
 fi
@@ -115,7 +140,13 @@ while IFS=$'\t' read -r status path newpath; do
     D)
       [ -n "${path:-}" ] && deletes+=("${path}")
       ;;
-    A | M | C*)
+    C*)
+      # Copy: git reports `C<score> <source> <destination>`. The new file is the
+      # destination; deploying the source would re-copy something unchanged and
+      # miss the file the commit actually added.
+      [ -n "${newpath:-}" ] && copies+=("${newpath}")
+      ;;
+    A | M)
       [ -n "${path:-}" ] && copies+=("${path}")
       ;;
     *)
@@ -148,11 +179,35 @@ for rel in "${copies[@]}"; do
 done
 
 for rel in "${deletes[@]}"; do
+  # gsutil expands wildcards in an rm argument, so a path containing one could
+  # remove far more than the single object the manifest named - and do it
+  # without passing through the MAX_DELETIONS ceiling above.
+  case "${rel}" in
+    *'*'* | *'?'* | *'['*)
+      log "::error::refusing to delete '${rel}': gsutil would treat it as a wildcard"
+      rc=1
+      continue
+      ;;
+  esac
+
   log "delete ${rel}"
   # An object that is already gone is not an error - the deploy is idempotent.
-  if ! gsutil -q rm "${DEST}/${rel}" 2>/dev/null; then
-    log "already absent: ${rel}"
+  # Anything else is: swallowing every failure meant a permission error, a bad
+  # bucket name or a network fault all reported as a successful removal, and
+  # the object stayed in the environment while the job went green.
+  if err="$(gsutil rm "${DEST}/${rel}" 2>&1)"; then
+    [ -n "${err}" ] && printf '%s\n' "${err}"
+    continue
   fi
+  case "${err}" in
+    *"No URLs matched"* | *"NotFoundException"* | *"404"*)
+      log "already absent: ${rel}"
+      ;;
+    *)
+      log "::error::failed to delete ${rel}: ${err}"
+      rc=1
+      ;;
+  esac
 done
 
 exit "${rc}"

@@ -55,10 +55,28 @@ env:
   BUNDLE_REPO: bm-udp-artifacts
 
 jobs:
+  # release.yml previously published with no gates at all. Because promote.yml
+  # deploys an already-published bundle without re-validating it, the whole
+  # release -> promote path to prod bypassed every check deploy.yml enforces:
+  # a release could tag, publish and promote code that fails lint or tests.
+  # These run before the tag is cut, so a failing release leaves no tag behind.
+  quality:
+    name: Quality gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  artifacts-valid:
+    name: Artifact validation gate
+    uses: ./.github/workflows/validate-dags.yml
+    permissions:
+      contents: read
+
   tag:
     name: Compute version and tag
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: [quality, artifacts-valid]
 
     permissions:
       contents: write

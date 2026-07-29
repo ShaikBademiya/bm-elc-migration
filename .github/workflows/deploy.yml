@@ -639,3 +639,59 @@ jobs:
           DEST: gs://${{ secrets.COMPOSER_BUCKET }}/data/jobs/${{ env.DOMAIN }}
         run: |
           echo "$MANIFEST" | bash .github/scripts/deploy_artifacts.sh _bundle/artifacts/jobs "$DEST" "$MODE" artifacts/jobs
+
+  # Without this, deploy.yml wrote no manifest at all: promote.yml was the only
+  # writer, so an environment reached by a branch push had either no record of
+  # what was running in it (dev) or a record left over from the last promotion
+  # that silently went stale (prod claimed 0.1.1 while serving 0.1.2.dev5).
+  # Runs after all four deploy jobs so it can only record a deploy that happened.
+  record-deployment:
+    name: Record the deployed version
+    runs-on: ubuntu-latest
+    needs: [setup, changes, version, deploy-dags, deploy-dbt, deploy-configs, deploy-jobs]
+    timeout-minutes: 10
+
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # Same path and shape promote.yml writes, so "what is running in this
+      # environment" has one answer regardless of how it got there. Written
+      # outside every deploy prefix, so a reconciliation cannot remove it.
+      - name: Write the deploy manifest
+        env:
+          TARGET: ${{ needs.setup.outputs.environment }}
+          VERSION: ${{ needs.version.outputs.bundle_version }}
+          BUCKET: ${{ secrets.COMPOSER_BUCKET }}
+          MODE: ${{ needs.changes.outputs.full == 'true' && 'full' || 'incremental' }}
+        run: |
+          set -euo pipefail
+          cat > deployed.json <<JSON
+          {
+            "environment": "${TARGET}",
+            "domain": "${DOMAIN}",
+            "version": "${VERSION}",
+            "deployed_by": "${GITHUB_ACTOR}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "source_sha": "${GITHUB_SHA}",
+            "source_ref": "${GITHUB_REF_NAME}",
+            "mode": "${MODE}"
+          }
+          JSON
+          cat deployed.json
+          gsutil cp deployed.json "gs://${BUCKET}/deploy-manifests/${DOMAIN}/${TARGET}.json"
+
+          {
+            echo ""
+            echo "Recorded \`${VERSION}\` as deployed to \`${TARGET}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
