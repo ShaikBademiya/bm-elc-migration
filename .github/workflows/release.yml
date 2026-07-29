@@ -87,6 +87,25 @@ jobs:
       has_databricks_bundle: ${{ steps.detect.outputs.has_databricks_bundle }}
 
     steps:
+      # Cutting a release from anywhere permanently claims a version number for
+      # whatever happened to be on that ref. master and main are retained but
+      # dead, and a release cut from either would publish stale code under a
+      # fresh tag that promote.yml would then deploy to prod. deploy.yml already
+      # refuses any branch but dev and prod; this applies the same rule.
+      #
+      # A step rather than a job-level `if:` on purpose: a false job condition
+      # skips the job and every job downstream of it, so the run goes green
+      # having released nothing. This fails, visibly.
+      - name: Refuse to release from a branch that is not dev or prod
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev | prod) echo "Releasing from '${GITHUB_REF_NAME}'." ;;
+            *)
+              echo "::error::Releases are cut from 'dev' or 'prod' only; got '${GITHUB_REF_NAME}'."
+              exit 1
+              ;;
+          esac
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0

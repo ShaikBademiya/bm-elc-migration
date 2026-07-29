@@ -235,6 +235,36 @@ def test_a_wildcard_path_is_refused(workspace: Path) -> None:
     assert "RM " not in result.stdout
 
 
+def test_rename_into_this_class_from_another_is_copied(workspace: Path) -> None:
+    """A file moved from artifacts/dbt into artifacts/dags must still deploy.
+
+    Old and new paths used to be tested together: if the OLD path was not under
+    this class the whole line was discarded, so the dags job never copied a file
+    that had just been moved into it and reported success anyway.
+    """
+    result = run(workspace, "R100\tartifacts/dbt/existing.py\tartifacts/dags/existing.py\n")
+    assert result.returncode == 0, result.stderr
+    assert "CP artifacts/dags/existing.py -> gs://bkt/dags/udp/existing.py" in result.stdout
+    # The old object belongs to the dbt prefix, so this job must not delete it.
+    assert "RM " not in result.stdout
+
+
+def test_rename_out_of_this_class_deletes_but_does_not_copy(workspace: Path) -> None:
+    """The mirror image: the dags job removes its copy and leaves the rest alone."""
+    result = run(workspace, "R100\tartifacts/dags/existing.py\tartifacts/dbt/existing.py\n")
+    assert result.returncode == 0, result.stderr
+    assert "RM gs://bkt/dags/udp/existing.py" in result.stdout
+    assert "CP " not in result.stdout
+
+
+def test_full_mode_refuses_a_bundle_missing_this_class(workspace: Path) -> None:
+    """A bundle missing a whole artifact class is broken, not an empty change set."""
+    shutil.rmtree(workspace / "artifacts" / "dags")
+    result = run(workspace, "", mode="full")
+    assert result.returncode == 1
+    assert "missing this class" in result.stdout
+
+
 def test_a_copy_deploys_the_new_file_not_the_source(workspace: Path) -> None:
     """git reports `C<score> <source> <destination>`; the destination is the new file."""
     result = run(workspace, "C85\tartifacts/dags/second.py\tartifacts/dags/existing.py\n")

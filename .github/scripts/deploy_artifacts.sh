@@ -43,6 +43,14 @@ MANIFEST_PREFIX="${MANIFEST_PREFIX%/}"
 log() { printf '%s\n' "$*"; }
 
 if [ ! -d "${SRC}" ]; then
+  # In full mode the source is an extracted artifact bundle, and a bundle that
+  # is missing an entire artifact class is a broken bundle, not an empty change
+  # set. Treating it as "nothing to deploy" let a promotion publish a partial
+  # state to an environment and report success.
+  if [ "${MODE}" = "full" ]; then
+    log "::error::${SRC} does not exist - the artifact bundle is missing this class; refusing to reconcile"
+    exit 1
+  fi
   log "${SRC} does not exist - nothing to deploy"
   exit 0
 fi
@@ -116,38 +124,42 @@ while IFS=$'\t' read -r status path newpath; do
   newpath="${newpath:-}"
   newpath="${newpath%$'\r'}"
 
-  # Only this artifact class, and only paths genuinely under it. Matched
-  # against the manifest prefix, which is repo-relative and may differ from
-  # where the files actually sit on disk.
+  # Old and new paths are tested against this artifact class INDEPENDENTLY.
+  # Testing only the old path meant a file renamed INTO this class from another
+  # one - `R100 artifacts/dbt/x.sql artifacts/dags/x.sql` - was skipped whole:
+  # the old path did not match, the line was discarded, and the new file was
+  # never copied while the job reported success.
+  old_rel=""
+  new_rel=""
   case "${path}" in
-    "${MANIFEST_PREFIX}/"*) ;;
-    *) continue ;;
+    "${MANIFEST_PREFIX}/"*) old_rel="${path#"${MANIFEST_PREFIX}/"}" ;;
   esac
-  path="${path#"${MANIFEST_PREFIX}/"}"
-  if [ -n "${newpath:-}" ]; then
-    case "${newpath}" in
-      "${MANIFEST_PREFIX}/"*) newpath="${newpath#"${MANIFEST_PREFIX}/"}" ;;
-      *) newpath="" ;;
-    esac
-  fi
+  case "${newpath}" in
+    "${MANIFEST_PREFIX}/"*) new_rel="${newpath#"${MANIFEST_PREFIX}/"}" ;;
+  esac
+
+  # Nothing in this line concerns this artifact class.
+  [ -z "${old_rel}" ] && [ -z "${new_rel}" ] && continue
 
   case "${status}" in
     R*)
-      # Rename: the old object goes, the new one is copied.
-      [ -n "${path:-}" ]    && deletes+=("${path}")
-      [ -n "${newpath:-}" ] && copies+=("${newpath}")
+      # Rename: drop the old object if it lived here, copy the new one if it
+      # lands here. A rename across classes is a delete in one and an add in
+      # the other, and each class's job sees only its own half.
+      [ -n "${old_rel}" ] && deletes+=("${old_rel}")
+      [ -n "${new_rel}" ] && copies+=("${new_rel}")
       ;;
     D)
-      [ -n "${path:-}" ] && deletes+=("${path}")
+      [ -n "${old_rel}" ] && deletes+=("${old_rel}")
       ;;
     C*)
       # Copy: git reports `C<score> <source> <destination>`. The new file is the
       # destination; deploying the source would re-copy something unchanged and
       # miss the file the commit actually added.
-      [ -n "${newpath:-}" ] && copies+=("${newpath}")
+      [ -n "${new_rel}" ] && copies+=("${new_rel}")
       ;;
     A | M)
-      [ -n "${path:-}" ] && copies+=("${path}")
+      [ -n "${old_rel}" ] && copies+=("${old_rel}")
       ;;
     *)
       log "ignoring unrecognised status '${status}' for ${path:-<none>}"

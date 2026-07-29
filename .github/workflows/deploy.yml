@@ -27,6 +27,11 @@ on:
       - 'databricks.yml'
       - 'pyproject.toml'
       - 'uv.lock'
+      # The image is built from this. Omitting it meant a Dockerfile edit
+      # triggered no deploy at all, so the published image silently drifted
+      # from the Dockerfile in the repo.
+      - 'Dockerfile'
+      - '.github/scripts/**'
       - '.github/workflows/**'
   workflow_dispatch:
     inputs:
@@ -166,9 +171,14 @@ jobs:
             MANIFEST="$(git diff --name-status -M "${BASE_SHA}" "${HEAD_SHA}")"
           fi
 
+          # `.*` rather than anchoring to the first path: a rename line is
+          # `R100<TAB>old<TAB>new`, so anchoring matched only the OLD path and a
+          # file renamed INTO amf/core/ produced no rebuild - the wheel and image
+          # were published without the module that had just moved in. Dockerfile
+          # is included because the image is built from it.
           if [ "${FULL}" = "true" ]; then
             PY=true
-          elif echo "${MANIFEST}" | grep -qE '^[A-Z][0-9]*[[:space:]]+(amf/core/|pyproject\.toml|uv\.lock|databricks\.yml)'; then
+          elif echo "${MANIFEST}" | grep -qE '^[A-Z][0-9]*[[:space:]].*(amf/core/|pyproject\.toml|uv\.lock|databricks\.yml|Dockerfile)'; then
             PY=true
           else
             PY=false
@@ -411,7 +421,31 @@ jobs:
           gcloud auth configure-docker \
             "${{ secrets.ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev" --quiet
 
+      # The wheel and the bundle both refuse to republish a version that already
+      # exists; the image did not. dev and prod share one Docker repository, so
+      # a prod deploy and a dev deploy at the same commit resolve to the SAME
+      # tag and the second one silently replaced the bytes the first published -
+      # the exact drift build-once-deploy-many exists to prevent.
+      - name: Skip if this image tag is already published
+        id: image_exists
+        env:
+          REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
+          PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
+          REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_DOCKER_REPOSITORY }}
+          VERSION: ${{ needs.version.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/amf"
+          if gcloud artifacts docker images describe "${IMAGE}:${VERSION}" \
+               --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "amf:${VERSION} is already published; leaving the existing image untouched."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Docker image
+        if: steps.image_exists.outputs.published != 'true'
         env:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}
@@ -431,6 +465,7 @@ jobs:
             .
 
       - name: Push Docker image
+        if: steps.image_exists.outputs.published != 'true'
         env:
           REGION: ${{ secrets.ARTIFACT_REGISTRY_REGION }}
           PROJECT_ID: ${{ secrets.ARTIFACT_REGISTRY_PROJECT_ID }}

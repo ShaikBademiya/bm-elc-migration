@@ -55,8 +55,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    environment:
-      name: ${{ inputs.environment }}
+    # Deliberately NOT bound to the target environment. This job only reads the
+    # registry, and every secret it needs is repository-scoped. Claiming the
+    # environment recorded a deployment for a job that deploys nothing, and once
+    # a required reviewer exists it would put the pre-flight check BEHIND the
+    # approval it is meant to inform - the reviewer would be asked to approve
+    # before anything had verified the version is real.
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -184,6 +188,17 @@ jobs:
           BUCKET: ${{ secrets.COMPOSER_BUCKET }}
         run: |
           set -euo pipefail
+
+          # The commit that BUILT the promoted bytes, recovered from the version
+          # itself (setuptools-scm encodes it as the g<sha> local segment).
+          # source_sha used to be GITHUB_SHA, which is the head of whatever
+          # branch the promotion was dispatched from - unrelated to the artifact
+          # being promoted, and actively misleading when answering "which commit
+          # is running in prod". A clean release tag carries no sha, so it is
+          # reported as the tag rather than invented.
+          BUILT_FROM="$(printf '%s' "${VERSION}" | sed -nE 's/.*-g([0-9a-f]+)$/\1/p')"
+          [ -z "${BUILT_FROM}" ] && BUILT_FROM="tagged release ${VERSION}"
+
           cat > deployed.json <<JSON
           {
             "environment": "${TARGET}",
@@ -191,7 +206,9 @@ jobs:
             "version": "${VERSION}",
             "promoted_by": "${GITHUB_ACTOR}",
             "run_id": "${GITHUB_RUN_ID}",
-            "source_sha": "${GITHUB_SHA}"
+            "built_from": "${BUILT_FROM}",
+            "dispatched_from_sha": "${GITHUB_SHA}",
+            "dispatched_from_ref": "${GITHUB_REF_NAME}"
           }
           JSON
           cat deployed.json
