@@ -1,0 +1,175 @@
+name: Test deploy.yml jobs
+
+# Tests deploy.yml one job at a time, ON A RUNNER.
+#
+# Why this exists rather than a developer running the suite locally: the thing
+# under test is a shell script executed by GitHub's runner, whose outputs are
+# consumed through GitHub's `steps.<id>.outputs` plumbing. A local replica gets
+# the bash semantics right and the plumbing not at all, and the plumbing is
+# where the interesting failure lives - a step can exit 0, write nothing, and
+# leave a downstream `environment:` binding empty.
+#
+# Two jobs, deliberately different in kind:
+#
+#   guard-plumbing   the script under test runs as a REAL Actions step, once per
+#                    branch name, and the assertions read the genuine
+#                    steps.<id>.outcome and steps.<id>.outputs values.
+#   scenario-suite   the full assertion sweep, including the cases that are
+#                    awkward to express as a matrix (injection payloads, unset
+#                    variables, static wiring of the workflow graph).
+#
+# Both extract the script from deploy.yml at run time. Neither contains a copy
+# of it, so neither can keep passing after deploy.yml changes underneath them.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflow-tests/**'
+      - '.github/workflows/test-deploy-jobs.yml'
+      - '.github/workflows/deploy.yml'
+  push:
+    branches:
+      - dev
+      - prod
+    paths:
+      - '.github/workflow-tests/**'
+      - '.github/workflows/test-deploy-jobs.yml'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-deploy-jobs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- job 1
+  # deploy.yml :: setup - resolve a branch name to an environment name.
+  #
+  # The failure that matters is not a crash. Every deploy job binds
+  # `environment: ${{ needs.setup.outputs.environment }}`, and that is what
+  # selects COMPOSER_BUCKET. So a wrong value deploys to the wrong bucket, and
+  # an EMPTY value binds no environment at all and silently falls back to
+  # repository-scoped secrets. Both look green. Hence every case asserts on the
+  # resolved output, not merely on the exit status.
+  guard-plumbing:
+    name: "setup guard: ${{ matrix.label }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The two supported branches.
+          - { label: 'dev',            ref: 'dev',              outcome: success, env: 'dev' }
+          - { label: 'prod',           ref: 'prod',             outcome: success, env: 'prod' }
+          # Retained but dead. These must never resolve to an environment.
+          - { label: 'master',         ref: 'master',           outcome: failure, env: '' }
+          - { label: 'main',           ref: 'main',             outcome: failure, env: '' }
+          # An ordinary working branch.
+          - { label: 'feature branch', ref: 'feature/AMF-123',  outcome: failure, env: '' }
+          # Near miss: the case arms must be exact, not prefixes.
+          - { label: 'develop',        ref: 'develop',          outcome: failure, env: '' }
+          - { label: 'production',     ref: 'production',       outcome: failure, env: '' }
+          # The case WORD must not be treated as a glob pattern.
+          - { label: 'glob star',      ref: '*',                outcome: failure, env: '' }
+          - { label: 'glob d-star',    ref: 'd*',               outcome: failure, env: '' }
+          # A tag name, which is what GITHUB_REF_NAME holds on a tag push.
+          - { label: 'tag name',       ref: 'v0.1.2',           outcome: failure, env: '' }
+          # Empty, and the shell metacharacter case.
+          - { label: 'empty ref',      ref: '',                 outcome: failure, env: '' }
+          - { label: 'injection',      ref: 'dev;echo PWNED',   outcome: failure, env: '' }
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      # Pulled out of deploy.yml rather than duplicated here. A copy would keep
+      # passing forever after someone edited the real one.
+      - name: Extract the setup job's script from deploy.yml
+        run: |
+          set -euo pipefail
+          python .github/workflow-tests/extract_step.py \
+            deploy.yml setup 0 "${RUNNER_TEMP}/setup_step.sh"
+          echo "--- script under test ---"
+          cat "${RUNNER_TEMP}/setup_step.sh"
+
+      # The real thing: an Actions step whose $GITHUB_OUTPUT is the runner's own
+      # file, so whatever the script writes becomes steps.guard.outputs.* by the
+      # same mechanism deploy.yml relies on.
+      #
+      # The branch name is passed through `env:` and referenced as "$REF", never
+      # interpolated into the command. `${{ matrix.ref }}` inline would make a
+      # branch name executable, which is the very thing the injection case is
+      # checking the script itself avoids.
+      - name: Run the guard
+        id: guard
+        continue-on-error: true
+        env:
+          REF: ${{ matrix.ref }}
+        run: GITHUB_REF_NAME="$REF" bash -e "${RUNNER_TEMP}/setup_step.sh"
+
+      - name: Assert outcome and resolved environment
+        env:
+          REF: ${{ matrix.ref }}
+          GOT_OUTCOME: ${{ steps.guard.outcome }}
+          GOT_ENV: ${{ steps.guard.outputs.environment }}
+          WANT_OUTCOME: ${{ matrix.outcome }}
+          WANT_ENV: ${{ matrix.env }}
+        run: |
+          set -euo pipefail
+          status=0
+
+          echo "ref            : '${REF}'"
+          echo "outcome        : got '${GOT_OUTCOME}'  want '${WANT_OUTCOME}'"
+          echo "environment    : got '${GOT_ENV}'  want '${WANT_ENV}'"
+
+          if [ "${GOT_OUTCOME}" != "${WANT_OUTCOME}" ]; then
+            echo "::error::ref '${REF}': step outcome '${GOT_OUTCOME}', expected '${WANT_OUTCOME}'"
+            status=1
+          fi
+
+          # The important half. On the reject path this asserts the step left NO
+          # output behind: an empty-but-present environment would bind no
+          # environment and deploy with repository-scoped secrets.
+          if [ "${GOT_ENV}" != "${WANT_ENV}" ]; then
+            echo "::error::ref '${REF}': resolved environment '${GOT_ENV}', expected '${WANT_ENV}'"
+            status=1
+          fi
+
+          if [ "${status}" -eq 0 ]; then
+            echo "OK: '${REF}' -> outcome=${GOT_OUTCOME} environment='${GOT_ENV}'"
+          fi
+          exit "${status}"
+
+  # ---------------------------------------------------------------- job 2
+  scenario-suite:
+    name: setup scenario suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: "deploy.yml :: setup"
+        run: python .github/workflow-tests/test_01_setup.py
