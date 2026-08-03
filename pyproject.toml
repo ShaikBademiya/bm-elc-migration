@@ -21,7 +21,7 @@ cluster = [
     "dlt[bigquery,filesystem]>=1.4",
     "databricks-sdk>=0.28",
     "google-cloud-bigquery>=3.0",
-    "google-cloud-bigquery-storage>=2.0",
+    "google-cloud-bigquery-storage>=2.39.0",
 ]
 agents = [
     "anthropic>=0.52",
